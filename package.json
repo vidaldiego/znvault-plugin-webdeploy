@@ -44,7 +44,7 @@
     "commander": "^14.0.2",
     "eslint": "^9.39.2",
     "typescript": "^5.9.3",
-    "vitest": "^4.0.17"
+    "vitest": "~4.0.17"
   },
   "engines": { "node": ">=18.0.0" }
 }
