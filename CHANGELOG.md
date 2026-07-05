@@ -3,6 +3,16 @@
 All notable changes to `@zincapp/znvault-plugin-webdeploy` are documented in
 this file.
 
+## 0.2.1
+
+Build/publish tooling only — no runtime change; plugin behavior identical to 0.2.0.
+
+- Pin `vitest` to the `~4.0.17` line: `vitest` 4.1's bundled `rolldown` imports
+  `node:util`'s `styleText` (Node 20.4+ only), which broke the Node 18 CI leg.
+- Drop the `npm-publish` GitHub environment from the release workflow; publish
+  via bare OIDC trusted publishing (repo + workflow binding). First release
+  published from CI with provenance.
+
 ## 0.2.0
 
 Performance optimizations: four non-breaking speed improvements to deployment

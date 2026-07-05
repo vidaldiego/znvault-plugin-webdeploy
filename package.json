@@ -1,14 +1,22 @@
 {
   "name": "@zincapp/znvault-plugin-webdeploy",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Generic web-app deployment plugin for znvault CLI (rsync/PM2/nginx over SSH-CA)",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
-    "./cli": { "types": "./dist/cli.d.ts", "import": "./dist/cli.js" }
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./cli": {
+      "types": "./dist/cli.d.ts",
+      "import": "./dist/cli.js"
+    }
   },
   "scripts": {
     "build": "tsc",
@@ -21,7 +29,14 @@
     "lint:fix": "ESLINT_USE_FLAT_CONFIG=false eslint 'src/**/*.ts' 'test/**/*.ts' --fix",
     "prepublishOnly": "npm run build:prod"
   },
-  "keywords": ["znvault", "deploy", "rsync", "pm2", "nginx", "ssh-ca"],
+  "keywords": [
+    "znvault",
+    "deploy",
+    "rsync",
+    "pm2",
+    "nginx",
+    "ssh-ca"
+  ],
   "author": "ZincApp",
   "license": "MIT",
   "repository": {
@@ -29,13 +44,19 @@
     "url": "git+https://github.com/vidaldiego/znvault-plugin-webdeploy.git"
   },
   "homepage": "https://github.com/vidaldiego/znvault-plugin-webdeploy#readme",
-  "bugs": { "url": "https://github.com/vidaldiego/znvault-plugin-webdeploy/issues" },
-  "publishConfig": { "access": "public" },
+  "bugs": {
+    "url": "https://github.com/vidaldiego/znvault-plugin-webdeploy/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "peerDependencies": {
     "@zincapp/znvault-cli": ">=2.11.0"
   },
   "peerDependenciesMeta": {
-    "@zincapp/znvault-cli": { "optional": true }
+    "@zincapp/znvault-cli": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^25.0.10",
@@ -46,5 +67,7 @@
     "typescript": "^5.9.3",
     "vitest": "~4.0.17"
   },
-  "engines": { "node": ">=18.0.0" }
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
