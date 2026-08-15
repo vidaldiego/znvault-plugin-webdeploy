@@ -2,8 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { validateDeployConfig } from '../src/cli/config-validate.js';
 
 const valid = {
-  hosts: ['10.0.0.1', '10.0.0.2'],
-  ssh: { user: 'sysadmin' },
+  hosts: ['192.0.2.1', '192.0.2.2'],
+  ssh: { user: 'ops' },
   versionFile: 'shared/version',
   app: {
     localPath: 'deploy', remotePath: 'app', pm2App: 'www',

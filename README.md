@@ -118,16 +118,21 @@ store file directly.
 
 ### Schema
 
+Addresses, SSH users and alias paths below are placeholders: the addresses are
+RFC 5737 documentation ranges (`192.0.2.0/24`), and the `alias:` paths are
+illustrative. Substitute your own — the real values live in your vault and your
+local config store, never in this repo.
+
 ```jsonc
 {
   // Required. Hosts are deployed to in array order (gated: a host is
   // skipped once an earlier host fails or fails its health gate, except
   // health failures on the LAST host, which are recorded but don't gate).
-  "hosts": ["10.0.0.1", "10.0.0.2"],
+  "hosts": ["192.0.2.1", "192.0.2.2"],
 
   // Required.
   "ssh": {
-    "user": "sysadmin",
+    "user": "ops",
     "port": 22,               // optional, default 22
     "principal": "deploy",    // optional, default "deploy"
     "ttlSeconds": 3600        // optional, default 3600 (1h)

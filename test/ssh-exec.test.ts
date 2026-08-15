@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { sshBaseArgs, sshTransportString, buildRsyncArgs, validateRsyncVersion, sshExec } from '../src/cli/ssh-exec.js';
 import type { HostConnection } from '../src/cli/types.js';
 
-const conn: HostConnection = { host: '10.0.0.1', port: 22, user: 'sysadmin', keyPath: '/k/id', certPath: '/k/id-webdeploy-cert.pub' };
+const conn: HostConnection = { host: '192.0.2.1', port: 22, user: 'ops', keyPath: '/k/id', certPath: '/k/id-webdeploy-cert.pub' };
 
 describe('sshBaseArgs', () => {
   it('includes port, identity, certificate and batch mode', () => {
@@ -19,7 +19,7 @@ describe('sshBaseArgs', () => {
 describe('buildRsyncArgs', () => {
   it('builds phase-B style args with delete/delay/filter', () => {
     const args = buildRsyncArgs({
-      src: 'public/', dest: 'sysadmin@10.0.0.1:/var/www/',
+      src: 'public/', dest: 'ops@192.0.2.1:/var/www/',
       transport: sshTransportString(conn),
       checksum: true, delete: true, delayUpdates: true,
       filters: ['- /[0-9][0-9][0-9][0-9][0-9]*/'],
@@ -30,7 +30,7 @@ describe('buildRsyncArgs', () => {
     expect(args).toContain('--delete-delay');
     expect(args).toContain('--filter=- /[0-9][0-9][0-9][0-9][0-9]*/');
     expect(args.at(-2)).toBe('public/');
-    expect(args.at(-1)).toBe('sysadmin@10.0.0.1:/var/www/');
+    expect(args.at(-1)).toBe('ops@192.0.2.1:/var/www/');
   });
 });
 

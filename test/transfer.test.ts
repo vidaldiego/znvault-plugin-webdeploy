@@ -2,10 +2,10 @@ import { describe, it, expect } from 'vitest';
 import { syncAppDir, installAppDeps, deployStatic, cleanupOldBuilds, withRemotePermissions, shouldInstallRemote } from '../src/cli/transfer.js';
 import type { HostConnection, ExecResult, WebDeployConfig } from '../src/cli/types.js';
 
-const conn: HostConnection = { host: '10.0.0.1', port: 22, user: 'sysadmin', keyPath: '/k/id', certPath: '/k/cert' };
+const conn: HostConnection = { host: '192.0.2.1', port: 22, user: 'ops', keyPath: '/k/id', certPath: '/k/cert' };
 
 const cfg: WebDeployConfig = {
-  hosts: ['10.0.0.1'], ssh: { user: 'sysadmin' }, versionFile: 'shared/version',
+  hosts: ['192.0.2.1'], ssh: { user: 'ops' }, versionFile: 'shared/version',
   app: { localPath: 'deploy', remotePath: 'zincapp-ts', pm2App: 'www', exclude: ['node_modules', '.yarn'], yarnVersion: '4.9.1' },
   static: { localPath: 'public/', remotePath: '/var/www/', retentionCount: 50 },
 };
@@ -33,7 +33,7 @@ describe('syncAppDir', () => {
     const rsync = h.rsyncCalls[0]!;
     expect(rsync).toContain('--exclude=node_modules');
     expect(rsync.at(-2)).toBe('deploy/');
-    expect(rsync.at(-1)).toBe('sysadmin@10.0.0.1:zincapp-ts/');
+    expect(rsync.at(-1)).toBe('ops@192.0.2.1:zincapp-ts/');
     expect(h.execCalls.some(c => c.includes('yarn install'))).toBe(false);
   });
 
@@ -177,17 +177,17 @@ describe('deployStatic', () => {
     await deployStatic(h.deps, conn, cfg, '30412');
     expect(h.rsyncCalls).toHaveLength(2);
     expect(h.rsyncCalls[0]!.at(-2)).toBe('public/30412/');
-    expect(h.rsyncCalls[0]!.at(-1)).toBe('sysadmin@10.0.0.1:/var/www/30412/');
+    expect(h.rsyncCalls[0]!.at(-1)).toBe('ops@192.0.2.1:/var/www/30412/');
     expect(h.rsyncCalls[1]).toContain('--delay-updates');
     expect(h.rsyncCalls[1]!.some(a => a.startsWith('--filter='))).toBe(true);
     // mkdir -p precedes the Phase A permission wrap (C1 fix).
     expect(h.execCalls[0]).toContain('mkdir -p /var/www/30412/');
     // Phase A permission wrap: scoped to the new versioned dir, recursive (it's one small new dir).
-    expect(h.execCalls[1]).toContain('chown -R sysadmin:www-data /var/www/30412/');
+    expect(h.execCalls[1]).toContain('chown -R ops:www-data /var/www/30412/');
     // Phase B permission wrap: recursive over the webroot (incident fix — rsync -a sets
     // mtimes on pre-existing nested shared dirs the deploy user doesn't own, e.g.
     // tinymce/plugins/*, so ownership must be granted all the way down, not just at the top).
-    expect(h.execCalls.some(c => c.includes('chown -R sysadmin:www-data /var/www/'))).toBe(true);
+    expect(h.execCalls.some(c => c.includes('chown -R ops:www-data /var/www/'))).toBe(true);
     expect(h.execCalls.at(-1)).toContain('chmod -R g-w /var/www/');
   });
 
@@ -241,7 +241,7 @@ describe('cleanupOldBuilds', () => {
   it('scopes the permission wrap to the webroot NON-recursively (QW3 — does not walk every build dir)', async () => {
     const h = harness();
     await cleanupOldBuilds(h.deps, conn, cfg);
-    expect(h.execCalls[0]).toBe('sudo chown sysadmin:www-data /var/www/');
+    expect(h.execCalls[0]).toBe('sudo chown ops:www-data /var/www/');
     expect(h.execCalls[0]).not.toContain('-R');
     expect(h.execCalls.at(-1)).toContain('chmod g-w /var/www/');
     expect(h.execCalls.at(-1)).not.toContain('-R');
@@ -253,7 +253,7 @@ describe('withRemotePermissions', () => {
     const h = harness();
     await expect(withRemotePermissions(h.deps, conn, '/var/www/', async () => { throw new Error('boom'); }))
       .rejects.toThrow('boom');
-    expect(h.execCalls[0]).toContain('chown -R sysadmin:www-data /var/www/');
+    expect(h.execCalls[0]).toContain('chown -R ops:www-data /var/www/');
     expect(h.execCalls.at(-1)).toContain('g-w');
     expect(h.execCalls.at(-1)).toContain('-R');
   });
@@ -277,7 +277,7 @@ describe('withRemotePermissions', () => {
   it('emits chown/chmod WITHOUT -R when {recursive:false} is passed', async () => {
     const h = harness();
     await withRemotePermissions(h.deps, conn, '/var/www/', { recursive: false }, async () => {});
-    expect(h.execCalls[0]).toBe('sudo chown sysadmin:www-data /var/www/');
+    expect(h.execCalls[0]).toBe('sudo chown ops:www-data /var/www/');
     expect(h.execCalls[1]).toBe('sudo chmod g+w /var/www/');
     expect(h.execCalls[2]).toBe('sudo chown www-data:www-data /var/www/');
     expect(h.execCalls[3]).toBe('sudo chmod g-w /var/www/');

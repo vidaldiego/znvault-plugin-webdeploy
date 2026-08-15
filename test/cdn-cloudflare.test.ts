@@ -41,12 +41,12 @@ describe('purgeCloudflare', () => {
 
 describe('verifyVersions', () => {
   it('compares served version with expected per host', async () => {
-    const probe = fakeProbe(host => ({ status: 200, body: host === '10.0.0.1' ? '30412' : '30411' }));
-    const res = await verifyVersions(probe, ['10.0.0.1', '10.0.0.2'], { expected: '30412', versionPath: '/version', hostHeader: 'my.zincapp.com' });
+    const probe = fakeProbe(host => ({ status: 200, body: host === '192.0.2.1' ? '30412' : '30411' }));
+    const res = await verifyVersions(probe, ['192.0.2.1', '192.0.2.2'], { expected: '30412', versionPath: '/version', hostHeader: 'my.zincapp.com' });
     expect(res?.allMatch).toBe(false);
     expect(res?.results).toEqual([
-      { server: '10.0.0.1', match: true, actual: '30412' },
-      { server: '10.0.0.2', match: false, actual: '30411' },
+      { server: '192.0.2.1', match: true, actual: '30412' },
+      { server: '192.0.2.2', match: false, actual: '30411' },
     ]);
   });
 
@@ -56,13 +56,13 @@ describe('verifyVersions', () => {
       seen.push({ host, path, hostHeader: opts.hostHeader });
       return { status: 200, body: '30412' };
     });
-    await verifyVersions(probe, ['10.0.0.1'], { expected: '30412', versionPath: '/version', hostHeader: 'my.zincapp.com' });
-    expect(seen).toEqual([{ host: '10.0.0.1', path: '/version', hostHeader: 'my.zincapp.com' }]);
+    await verifyVersions(probe, ['192.0.2.1'], { expected: '30412', versionPath: '/version', hostHeader: 'my.zincapp.com' });
+    expect(seen).toEqual([{ host: '192.0.2.1', path: '/version', hostHeader: 'my.zincapp.com' }]);
   });
 
   it('treats a non-ok probe result as a mismatch, using the body as the actual value', async () => {
     const probe = fakeProbe(() => ({ status: 0, body: 'error: request timed out' }));
-    const res = await verifyVersions(probe, ['10.0.0.1'], { expected: '30412', versionPath: '/version' });
+    const res = await verifyVersions(probe, ['192.0.2.1'], { expected: '30412', versionPath: '/version' });
     expect(res?.allMatch).toBe(false);
     expect(res?.results[0]?.actual).toBe('HTTP 0: error: request timed out');
   });
@@ -70,7 +70,7 @@ describe('verifyVersions', () => {
   it('truncates non-ok response bodies to 120 characters in the actual value', async () => {
     const longBody = 'x'.repeat(150);
     const probe = fakeProbe(() => ({ status: 500, body: longBody }));
-    const res = await verifyVersions(probe, ['10.0.0.1'], { expected: '30412', versionPath: '/version' });
+    const res = await verifyVersions(probe, ['192.0.2.1'], { expected: '30412', versionPath: '/version' });
     expect(res?.allMatch).toBe(false);
     expect(res?.results[0]?.actual).toBe(`HTTP 500: ${'x'.repeat(120)}`);
   });
@@ -81,16 +81,16 @@ describe('verifyVersions', () => {
       calls++;
       return { ok: true, status: 200, body: calls >= 3 ? '30412' : '30411' };
     };
-    const res = await verifyVersions(probe as never, ['10.0.0.1'],
+    const res = await verifyVersions(probe as never, ['192.0.2.1'],
       { expected: '30412', versionPath: '/version', retryCeilingMs: 5000, retryIntervalMs: 1 });
     expect(res.allMatch).toBe(true);
-    expect(res.results[0]).toEqual({ server: '10.0.0.1', match: true, actual: '30412' });
+    expect(res.results[0]).toEqual({ server: '192.0.2.1', match: true, actual: '30412' });
     expect(calls).toBeGreaterThanOrEqual(3);
   });
 
   it('reports mismatch after the ceiling if it never matches', async () => {
     const probe = async () => ({ ok: true, status: 200, body: '30411' });
-    const res = await verifyVersions(probe as never, ['10.0.0.1'],
+    const res = await verifyVersions(probe as never, ['192.0.2.1'],
       { expected: '30412', versionPath: '/version', retryCeilingMs: 5, retryIntervalMs: 1 });
     expect(res.allMatch).toBe(false);
     expect(res.results[0]?.actual).toBe('30411');

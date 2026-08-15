@@ -7,8 +7,8 @@ import type { probeVersion } from '../src/cli/http-probe.js';
 const fakeProbe: typeof probeVersion = async (_host, _path) => ({ ok: true, status: 200, body: '30412' });
 
 const cfg: WebDeployConfig = {
-  hosts: ['10.0.0.1', '10.0.0.2'],
-  ssh: { user: 'sysadmin' },
+  hosts: ['192.0.2.1', '192.0.2.2'],
+  ssh: { user: 'ops' },
   versionFile: 'shared/version',
   app: { localPath: 'deploy', remotePath: 'app', pm2App: 'www', env: { API_KEY: 'resolved-secret', NODE_ENV: 'production' } },
   static: { localPath: 'public/', remotePath: '/var/www/' },
@@ -17,7 +17,7 @@ const cfg: WebDeployConfig = {
   verify: { versionPath: '/version', hostHeader: 'my.zincapp.com' },
 };
 
-const conns: HostConnection[] = cfg.hosts.map(host => ({ host, port: 22, user: 'sysadmin', keyPath: 'k', certPath: 'c' }));
+const conns: HostConnection[] = cfg.hosts.map(host => ({ host, port: 22, user: 'ops', keyPath: 'k', certPath: 'c' }));
 
 const PM2_OK = JSON.stringify([{ name: 'www', pm2_env: { status: 'online' } }]);
 
@@ -65,13 +65,13 @@ describe('runDeploy', () => {
     expect(summary.hosts.map(h => h.success)).toEqual([true, true]);
     expect(events.some(e => e.startsWith('fetch:https://api.cloudflare.com'))).toBe(true);
     // host 1 fully deployed before host 2 starts
-    const firstH2 = events.findIndex(e => e.includes('10.0.0.2'));
-    const lastH1Deploy = events.findIndex(e => e.startsWith('rsync') && e.includes('10.0.0.1:/var/www/'));
+    const firstH2 = events.findIndex(e => e.includes('192.0.2.2'));
+    const lastH1Deploy = events.findIndex(e => e.startsWith('rsync') && e.includes('192.0.2.1:/var/www/'));
     expect(lastH1Deploy).toBeLessThan(firstH2);
   });
 
   it('aborts remaining hosts when a deploy fails, and exits unsuccessful', async () => {
-    const { deps } = makeDeps({ failHost: '10.0.0.1' });
+    const { deps } = makeDeps({ failHost: '192.0.2.1' });
     const summary = await runDeploy('prod', cfg, conns, deps);
     expect(summary.success).toBe(false);
     expect(summary.hosts[0]?.success).toBe(false);
@@ -79,7 +79,7 @@ describe('runDeploy', () => {
   });
 
   it('gate failure on host 1 skips host 2 but host 1 stays deployed (warning)', async () => {
-    const { deps } = makeDeps({ nginxDownOn: '10.0.0.1' });
+    const { deps } = makeDeps({ nginxDownOn: '192.0.2.1' });
     const summary = await runDeploy('prod', cfg, conns, deps);
     expect(summary.hosts[0]?.success).toBe(true);
     expect(summary.hosts[0]?.healthOk).toBe(false);
@@ -91,7 +91,7 @@ describe('runDeploy', () => {
   it('renders the env file via stdin pipe with resolved values', async () => {
     const { deps, events } = makeDeps();
     await runDeploy('prod', cfg, conns, deps);
-    expect(events.some(e => e.startsWith('pipe:10.0.0.1'))).toBe(true);
+    expect(events.some(e => e.startsWith('pipe:192.0.2.1'))).toBe(true);
   });
 
   it('applies redact() to the webhook body so a secret in a host error never reaches the POST', async () => {
@@ -99,12 +99,12 @@ describe('runDeploy', () => {
     const webhookCfg: WebDeployConfig = { ...cfg, notify: { webhook: 'https://hooks.example/webhook' } };
     let capturedBody = '';
     const { deps } = makeDeps({
-      failHost: '10.0.0.1',
+      failHost: '192.0.2.1',
       redact: s => s.split(SECRET).join('[REDACTED]'),
     });
     // Simulate a host error that embeds a registered secret value.
     deps.exec = async (conn, command): Promise<ExecResult> => {
-      if (command.slice(0, 5) === 'mkdir' && conn.host === '10.0.0.1') {
+      if (command.slice(0, 5) === 'mkdir' && conn.host === '192.0.2.1') {
         throw new Error(`boom: ${SECRET}`);
       }
       return { code: 0, stdout: '', stderr: '' };
@@ -126,12 +126,12 @@ describe('nginx reload gating', () => {
   // Single host, no `static`, no health checks — isolates the reload decision
   // from the rest of the pipeline.
   const noStaticCfg: WebDeployConfig = {
-    hosts: ['10.0.0.1'],
-    ssh: { user: 'sysadmin' },
+    hosts: ['192.0.2.1'],
+    ssh: { user: 'ops' },
     versionFile: 'shared/version',
     app: { localPath: 'deploy', remotePath: 'app', pm2App: 'www' },
   };
-  const singleConn: HostConnection[] = [{ host: '10.0.0.1', port: 22, user: 'sysadmin', keyPath: 'k', certPath: 'c' }];
+  const singleConn: HostConnection[] = [{ host: '192.0.2.1', port: 22, user: 'ops', keyPath: 'k', certPath: 'c' }];
 
   function makeSimpleDeps() {
     const execCommands: string[] = [];

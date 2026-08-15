@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { loadConfigs, setConfig, getConfig, importConfigFile } from '../src/cli/config-store.js';
 
 const minimal = {
-  hosts: ['10.0.0.1'], ssh: { user: 'sysadmin' }, versionFile: 'shared/version',
+  hosts: ['192.0.2.1'], ssh: { user: 'ops' }, versionFile: 'shared/version',
   static: { localPath: 'public/', remotePath: '/var/www/' },
 };
 
