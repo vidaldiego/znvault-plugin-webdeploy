@@ -1,6 +1,6 @@
 {
   "name": "@zincapp/znvault-plugin-webdeploy",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Generic web-app deployment plugin for znvault CLI (rsync/PM2/nginx over SSH-CA)",
   "type": "module",
   "main": "dist/index.js",
@@ -20,7 +20,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "build:prod": "tsc --sourceMap false",
+    "build:prod": "npm run clean && tsc --sourceMap false",
     "clean": "rm -rf dist",
     "test": "vitest run",
     "test:watch": "vitest",

@@ -154,9 +154,18 @@ export async function installAppDeps(deps: TransferDeps, conn: HostConnection, c
     return;
   }
 
-  deps.log(`[${conn.host}] Pinning yarn@${app.yarnVersion} and installing...`);
+  deps.log(`[${conn.host}] Pinning yarn@${app.yarnVersion} and installing immutably...`);
   await execOrThrow(deps.exec, conn, `cd ${app.remotePath} && corepack use yarn@${app.yarnVersion}`, 'corepack use');
-  await execOrThrow(deps.exec, conn, `cd ${app.remotePath} && yarn install`, 'yarn install');
+  // The staged lockfile is part of the accepted web artifact. A mutable
+  // install can silently rewrite it on one site, leaving two deployments
+  // with the same visible build number but different dependency lineages.
+  // Yarn's immutable mode makes that drift a hard deploy failure.
+  await execOrThrow(
+    deps.exec,
+    conn,
+    `cd ${app.remotePath} && yarn install --immutable`,
+    'yarn install --immutable'
+  );
   await execOrThrow(deps.exec, conn, `printf %s "${localHash}" > ${stampPath}`, 'write install stamp');
 }
 

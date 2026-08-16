@@ -71,11 +71,11 @@ describe('syncAppDir', () => {
 });
 
 describe('installAppDeps', () => {
-  it('pins yarn via corepack then installs', async () => {
+  it('pins yarn via corepack then installs without changing the accepted lockfile', async () => {
     const h = harness();
     await installAppDeps(h.deps, conn, cfg);
     expect(h.execCalls.some(c => c.includes('corepack use yarn@4.9.1'))).toBe(true);
-    expect(h.execCalls.some(c => c.includes('yarn install'))).toBe(true);
+    expect(h.execCalls.some(c => c.includes('yarn install --immutable'))).toBe(true);
   });
 });
 

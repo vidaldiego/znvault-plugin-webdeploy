@@ -24,10 +24,11 @@ A single `znvault webdeploy run <config>` invocation:
    - rsyncs the app directory (if `app` is configured),
    - renders `.env` and any extra `app.files` from resolved secrets and
      writes them to the remote host over SSH **stdin** (mode 0600),
-   - runs `corepack use yarn@<version> && yarn install` (if `app.yarnVersion`
+   - runs `corepack use yarn@<version> && yarn install --immutable` (if `app.yarnVersion`
      is set), **skipped if the remote `package.json` + `yarn.lock` hash
      matches the previous stamp file AND `node_modules` exists** — fail-safe,
-     any missing/corrupt stamp/hash forces a fresh install,
+     any missing/corrupt stamp/hash forces a fresh install, while any attempted
+     lockfile rewrite fails the deploy,
    - rsyncs static assets in two phases: a new versioned directory first
      (with scope-limited `chown`/`chmod -R` to the new dir only), then an
      atomic, `--delay-updates` switchover of shared/HTML files (with
@@ -382,11 +383,13 @@ The plugin includes four non-breaking performance optimizations:
   SSH user with `--delay-updates` (directory write suffices).
 
 - **QW4 (install gate):** Dependency installation now skips `corepack use`
-  and `yarn install` entirely when the remote manifest hash
+  and `yarn install --immutable` entirely when the remote manifest hash
   (sha256 of `package.json` + `yarn.lock`) matches the stamp file
   `<remotePath>/.deploy-install-stamp` AND `node_modules` exists on the
   remote. Any doubt (missing/corrupt stamp or `node_modules`) forces a fresh
-  install — fail-safe.
+  install — fail-safe. The immutable install refuses dependency resolution
+  that would alter the accepted lockfile, so equal build labels cannot hide
+  site-specific dependency drift.
 
 - **QW5 (poll instead of sleep):** PM2 settle and version verification no
   longer use fixed-duration sleeps. `reloadOrStartPm2` polls `pm2 describe`
