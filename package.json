@@ -1,6 +1,6 @@
 {
   "name": "@zincapp/znvault-plugin-webdeploy",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Generic web-app deployment plugin for znvault CLI (rsync/PM2/nginx over SSH-CA)",
   "type": "module",
   "main": "dist/index.js",

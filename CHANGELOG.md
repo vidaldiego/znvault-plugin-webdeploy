@@ -3,7 +3,7 @@
 All notable changes to `@zincapp/znvault-plugin-webdeploy` are documented in
 this file.
 
-## 0.2.2 (unreleased)
+## 0.2.3 (unreleased)
 
 - Make host health, Cloudflare purge and served-version identity blocking gates
   for the command exit code, including a health failure on the final host.
