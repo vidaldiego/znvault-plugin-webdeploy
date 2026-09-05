@@ -18,13 +18,15 @@ export function buildSummaryLines(summary: RunSummary): string[] {
   lines.push(`Deploy summary — config '${summary.config}'`);
   lines.push(`Build: ${summary.build}`);
   for (const h of summary.hosts) {
-    if (h.success) lines.push(`  ✅ ${h.host}${h.healthOk ? '' : ' (health warnings)'}`);
+    if (h.success && h.healthOk) lines.push(`  ✅ ${h.host}`);
+    else if (h.success) lines.push(`  ❌ ${h.host}: health gate failed`);
     else if (h.skipped) lines.push(`  ⏭️ ${h.host}: skipped`);
     else lines.push(`  ❌ ${h.host}: ${h.error ?? 'failed'}`);
     for (const r of h.healthResults) lines.push(`      ${r}`);
   }
-  if (summary.purge) lines.push(summary.purge.ok ? '  ✅ CDN purge ok' : `  ⚠️ CDN purge failed: ${summary.purge.detail ?? ''}`);
-  if (summary.verify) lines.push(summary.verify.allMatch ? '  ✅ All hosts serve the expected version' : '  ⚠️ Version mismatch on at least one host');
+  if (summary.purge) lines.push(summary.purge.ok ? '  ✅ CDN purge ok' : `  ❌ CDN purge failed: ${summary.purge.detail ?? ''}`);
+  if (summary.verify) lines.push(summary.verify.allMatch ? '  ✅ All hosts serve the expected version' : '  ❌ Version mismatch on at least one host');
+  if (summary.recoveryRequired) lines.push('  ❌ Recovery required; old builds were retained.');
   for (const w of summary.warnings) lines.push(`  ⚠️ ${w}`);
   lines.push(summary.success ? '🎉 Deploy complete.' : '❌ Deploy incomplete — see above.');
   lines.push('='.repeat(60));

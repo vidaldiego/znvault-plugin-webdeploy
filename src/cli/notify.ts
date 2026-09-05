@@ -11,7 +11,8 @@ export async function sendWebhook(
   redact: (s: string) => string
 ): Promise<void> {
   const serverLines = summary.hosts.map(h => {
-    if (h.success) return `  ✅ ${h.host}`;
+    if (h.success && h.healthOk) return `  ✅ ${h.host}`;
+    if (h.success) return `  ❌ ${h.host}: health gate failed`;
     if (h.skipped) return `  ⏭️ ${h.host} (skipped)`;
     return `  ❌ ${h.host}: ${h.error ?? 'failed'}`;
   }).join('\n');

@@ -25,7 +25,7 @@ function makeDeps(opts: { failHost?: string; nginxDownOn?: string; redact?: (s: 
   const events: string[] = [];
   const deps: RunDeps = {
     exec: async (conn, command): Promise<ExecResult> => {
-      events.push(`exec:${conn.host}:${command.slice(0, 40)}`);
+      events.push(`exec:${conn.host}:${command}`);
       if (command.includes('pm2 jlist')) return { code: 0, stdout: PM2_OK, stderr: '' };
       if (command.includes('pm2 describe')) return { code: 0, stdout: 'status online', stderr: '' };
       // Batched health script (cfg.healthChecks === [{ type: 'systemd', unit: 'nginx' }]):
@@ -78,14 +78,50 @@ describe('runDeploy', () => {
     expect(summary.hosts[1]?.skipped).toBe(true);
   });
 
-  it('gate failure on host 1 skips host 2 but host 1 stays deployed (warning)', async () => {
+  it('gate failure on host 1 skips host 2, requires recovery and retains old builds', async () => {
     const { deps } = makeDeps({ nginxDownOn: '192.0.2.1' });
     const summary = await runDeploy('prod', cfg, conns, deps);
     expect(summary.hosts[0]?.success).toBe(true);
     expect(summary.hosts[0]?.healthOk).toBe(false);
     expect(summary.hosts[1]?.skipped).toBe(true);
     expect(summary.success).toBe(false); // a skip means not all hosts deployed
+    expect(summary.recoveryRequired).toBe(true);
     expect(summary.warnings.join(' ')).toMatch(/health/i);
+    expect(summary.warnings.join(' ')).toMatch(/old builds were retained/i);
+  });
+
+  it('fails the deploy when the last host health gate fails', async () => {
+    const { deps } = makeDeps({ nginxDownOn: '192.0.2.2' });
+    const summary = await runDeploy('prod', cfg, conns, deps);
+    expect(summary.hosts.map(h => h.success)).toEqual([true, true]);
+    expect(summary.hosts[1]?.healthOk).toBe(false);
+    expect(summary.success).toBe(false);
+    expect(summary.recoveryRequired).toBe(true);
+  });
+
+  it('fails the deploy and retains old builds when CDN purge fails', async () => {
+    const { deps, events } = makeDeps();
+    deps.fetchImpl = (async (url: string | URL | Request) => {
+      events.push(`fetch:${String(url)}`);
+      if (String(url).includes('api.cloudflare.com')) return new Response('no', { status: 500 });
+      return new Response('30412', { status: 200 });
+    }) as typeof fetch;
+    const summary = await runDeploy('prod', cfg, conns, deps);
+    expect(summary.purge?.ok).toBe(false);
+    expect(summary.success).toBe(false);
+    expect(summary.recoveryRequired).toBe(true);
+    expect(events.some(e => e.includes('tail -n'))).toBe(false);
+  });
+
+  it('fails the deploy and retains old builds on version mismatch', async () => {
+    const { deps, events } = makeDeps();
+    deps.probeVersion = async host => ({ ok: true, status: 200, body: host.endsWith('.2') ? 'wrong' : '30412' });
+    deps.versionVerifyCeilingMs = 0;
+    const summary = await runDeploy('prod', cfg, conns, deps);
+    expect(summary.verify?.allMatch).toBe(false);
+    expect(summary.success).toBe(false);
+    expect(summary.recoveryRequired).toBe(true);
+    expect(events.some(e => e.includes('tail -n'))).toBe(false);
   });
 
   it('renders the env file via stdin pipe with resolved values', async () => {

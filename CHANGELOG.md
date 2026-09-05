@@ -3,6 +3,17 @@
 All notable changes to `@zincapp/znvault-plugin-webdeploy` are documented in
 this file.
 
+## 0.2.2 (unreleased)
+
+- Make host health, Cloudflare purge and served-version identity blocking gates
+  for the command exit code, including a health failure on the final host.
+- Retain old versioned assets and report `recoveryRequired` when a deployment
+  changed at least one host but the full post-deploy gate did not converge.
+- Publish only after the reusable CI workflow succeeds for the tag commit and
+  tag, package, lockfile and current `main` identify the same release.
+- Pack once, install and verify the exact npm tarball, preserve its SHA-256, and
+  publish that verified artifact with OIDC provenance.
+
 ## 0.2.1
 
 Build/publish tooling only — no runtime change; plugin behavior identical to 0.2.0.

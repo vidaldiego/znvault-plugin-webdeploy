@@ -39,22 +39,24 @@ A single `znvault webdeploy run <config>` invocation:
    - reloads nginx,
    - runs the configured health checks **via one remote shell script** that
      emits `idx|STATUS|detail` lines (one per check), parsed locally into
-     the same result strings as before — if they fail on any host except the
-     last, the remaining hosts are **skipped** (gated rolling deploy).
+     the same result strings as before — if they fail, the command fails; when
+     more hosts remain, they are **skipped** (gated rolling deploy).
 4. Once at least one host deployed successfully: purges the Cloudflare CDN
    cache, waits for propagation, then **polls `GET /version` every 250ms
    up to a 5-second ceiling** instead of a blind 3-second sleep, verifies
    the served version on every successfully deployed host.
-5. Cleans up old versioned build directories (retention count), syncs help
-   content, and posts a webhook summary.
+5. Only after every host, health check, CDN purge and version check succeeds,
+   cleans up old versioned build directories (retention count). Help sync and
+   webhook notification remain best effort.
 
-Non-fatal problems (CDN purge failure, version-verify mismatch, health
-warnings) are recorded as **warnings** in the run summary; they do not fail
-the command. See [Exit codes](#exit-codes).
+If any blocking post-deploy gate fails after a host changed, the command exits
+non-zero, marks the summary `recoveryRequired`, and retains old versioned assets
+for recovery. See [Exit codes](#exit-codes).
 
 ## Install / registration
 
-This package is not yet published; register it from a local build.
+The package is published on npm. A local-path registration is still useful for
+testing an unreleased build:
 
 ```bash
 cd znvault-plugin-webdeploy
@@ -85,7 +87,7 @@ znvault webdeploy --help
 znvault plugin list
 ```
 
-Once the package is published to the registry, the equivalent entry is:
+The registry-backed entry is:
 
 ```json
 { "plugins": [{ "package": "@zincapp/znvault-plugin-webdeploy" }] }
@@ -127,8 +129,8 @@ local config store, never in this repo.
 ```jsonc
 {
   // Required. Hosts are deployed to in array order (gated: a host is
-  // skipped once an earlier host fails or fails its health gate, except
-  // health failures on the LAST host, which are recorded but don't gate).
+  // skipped once an earlier host fails or fails its health gate. A health
+  // failure on the last host still makes the whole command fail).
   "hosts": ["192.0.2.1", "192.0.2.2"],
 
   // Required.
@@ -340,17 +342,16 @@ URL's hostname, making vhost-routed version checks impossible).
 
 ## Exit codes
 
-**Exit code is non-zero if, and only if, at least one host's deploy
-failed or was skipped** (`RunSummary.success === false`, i.e. not every
-entry in `hosts[]` succeeded).
+`run` exits zero only when every configured host deployment and health gate
+succeeds, the configured CDN purge succeeds, and every configured version
+probe serves the requested build. If at least one host changed before a gate
+failed, the JSON summary sets `recoveryRequired: true`; old versioned assets
+are retained and the human summary says recovery is required. Cleanup errors
+and optional notification/help-sync failures remain non-blocking.
 
-Everything else that can go wrong during a run — CDN purge failure, version
-verification mismatch, a health check warning on a host that still deployed
-— is recorded in `RunSummary.warnings` / per-host `healthResults` and
-printed in the summary, but does **not** affect the exit code. `check`
-follows the same idea at preflight time: it fails (exit 1) only when rsync
-version, secret resolution/cert signing, SSH reachability, or a health check
-itself fails — not on soft warnings within a check.
+`check` exits non-zero when config validation, version, secret resolution/cert
+signing, SSH reachability, or a health check itself fails. Soft disk/memory
+threshold warnings do not fail `check`.
 
 ## Locking
 

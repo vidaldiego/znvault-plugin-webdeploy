@@ -27,6 +27,8 @@ export interface RunDeps {
   pm2SettleMs?: number;
   /** Injectable Host-header-aware HTTP probe for verifyVersions. Omit to use the real node:http probe. */
   probeVersion?: typeof probeVersion;
+  /** Injectable verification retry ceiling for deterministic tests. */
+  versionVerifyCeilingMs?: number;
 }
 
 export function renderEnvFile(env: Record<string, string>): string {
@@ -115,7 +117,7 @@ export async function runDeploy(
     build,
     hosts,
     warnings,
-    success: hosts.every(h => h.success),
+    success: false,
   };
 
   const anyDeployed = hosts.some(h => h.success);
@@ -132,14 +134,24 @@ export async function runDeploy(
           expected: build,
           versionPath: cfg.verify.versionPath,
           hostHeader: cfg.verify.hostHeader,
-          retryCeilingMs: VERSION_VERIFY_CEILING_MS,
+          retryCeilingMs: deps.versionVerifyCeilingMs ?? VERSION_VERIFY_CEILING_MS,
         }
       );
       if (summary.verify && !summary.verify.allMatch) warnings.push('version verification mismatch on at least one host');
     }
+  }
+
+  const hostGatesOk = hosts.length === conns.length && hosts.every(h => h.success && h.healthOk);
+  const purgeOk = !cfg.cdn || summary.purge?.ok === true;
+  const versionOk = !cfg.verify || summary.verify?.allMatch === true;
+  summary.success = hostGatesOk && purgeOk && versionOk;
+  summary.recoveryRequired = anyDeployed && !summary.success;
+
+  // Old assets are the recovery boundary for stale cached HTML and an
+  // incomplete rollout. Retire them only after every blocking gate converges.
+  if (anyDeployed && summary.success) {
     const tdeps: TransferDeps = { exec: deps.exec, rsync: deps.rsync, log: deps.log };
     for (const h of hosts) {
-      if (!h.success) continue;
       const conn = conns.find(c => c.host === h.host)!;
       try {
         await cleanupOldBuilds(tdeps, conn, cfg);
@@ -147,6 +159,8 @@ export async function runDeploy(
         warnings.push(`cleanup failed on ${h.host}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
+  } else if (summary.recoveryRequired) {
+    warnings.push('deployment changed at least one host but did not pass every gate; old builds were retained for recovery');
   }
 
   if (cfg.notify?.helpSync) await syncHelp(deps.fetchImpl, cfg.notify.helpSync, deps.log);
