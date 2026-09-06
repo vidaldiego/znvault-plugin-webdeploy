@@ -24,6 +24,21 @@ describe('buildSummaryLines', () => {
     expect(text).toContain('⏭️ h2');
     expect(text).toMatch(/⚠️.*health check failed/);
   });
+
+  it('renders failed health and recovery as blocking failures', () => {
+    const failed: RunSummary = {
+      config: 'prod',
+      build: '30412',
+      hosts: [{ host: 'h1', success: true, healthResults: ['failed'], healthOk: false }],
+      warnings: ['old builds retained'],
+      success: false,
+      recoveryRequired: true,
+    };
+    const rendered = buildSummaryLines(failed).join('\n');
+    expect(rendered).toMatch(/health gate failed/);
+    expect(rendered).toMatch(/Recovery required/);
+    expect(rendered).toMatch(/Deploy incomplete/);
+  });
 });
 
 describe('assertTransportSafePaths', () => {

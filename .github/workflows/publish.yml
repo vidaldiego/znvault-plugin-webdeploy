@@ -6,52 +6,66 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
+
+concurrency:
+  group: webdeploy-npm-publication
+  cancel-in-progress: false
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: 'npm'
-      - name: Install dependencies
-        run: npm ci
-      - name: Run tests
-        run: npm test
-      - name: Build
-        run: npm run build
+  validate:
+    uses: ./.github/workflows/ci.yml
 
   publish:
-    needs: test
+    needs: validate
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
-          cache: 'npm'
-      - name: Upgrade npm to latest (OIDC requires 11.5.1+)
-        run: npm install -g npm@latest
+      - name: Update npm for OIDC support
+        run: npm install -g npm@11.10.1
+      - name: Verify release identity
+        run: node scripts/check-release.mjs "$GITHUB_REF_NAME"
       - name: Install dependencies
         run: npm ci
-      - name: Build
-        run: npm run build
-      - name: Publish to npm with provenance
-        run: npm publish --provenance --access public
+      - name: Build production package
+        run: npm run build:prod
+      - name: Pack and verify the installable artifact
+        run: |
+          mkdir -p "$RUNNER_TEMP/webdeploy-release"
+          npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/webdeploy-release" --json > "$RUNNER_TEMP/webdeploy-pack.json"
+          FILE=$(node -p "require(process.env.RUNNER_TEMP + '/webdeploy-pack.json')[0].filename")
+          PACKAGE_PATH="$RUNNER_TEMP/webdeploy-release/$FILE"
+          node scripts/verify-package.mjs "$PACKAGE_PATH" "${GITHUB_REF_NAME#v}"
+          sha256sum "$PACKAGE_PATH" > "$RUNNER_TEMP/webdeploy-package.sha256"
+          printf 'PACKAGE_PATH=%s\n' "$PACKAGE_PATH" >> "$GITHUB_ENV"
+      - name: Preserve verified artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: webdeploy-package-${{ github.ref_name }}
+          path: |
+            ${{ runner.temp }}/webdeploy-release/*.tgz
+            ${{ runner.temp }}/webdeploy-package.sha256
+          if-no-files-found: error
+      - name: Publish the verified tarball with OIDC
+        run: |
+          sha256sum --check "$RUNNER_TEMP/webdeploy-package.sha256"
+          npm publish "$PACKAGE_PATH" --ignore-scripts --access public --provenance
 
   github-release:
     needs: publish
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Create GitHub Release

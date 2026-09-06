@@ -76,6 +76,8 @@ export interface RunSummary {
   purge?: { ok: boolean; detail?: string };
   verify?: { allMatch: boolean; results: { server: string; match: boolean; actual: string }[] };
   warnings: string[];
-  /** true iff every host deployed (drives exit code) */
+  /** True only after every host deploy, health gate, CDN purge and version check succeeded. */
   success: boolean;
+  /** At least one host changed, but the complete post-deploy gate did not converge. */
+  recoveryRequired?: boolean;
 }
