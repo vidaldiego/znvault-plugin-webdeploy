@@ -44,7 +44,7 @@ function checkFragment(idx: number, spec: HealthCheckSpec): string {
         `RESP=0`,
         ...ports.map(p =>
           `CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://localhost:${p}/ || echo "timeout"); ` +
-          `if [ "$CODE" != "timeout" ] && [ "$CODE" -lt 500 ] 2>/dev/null; then RESP=$((RESP+1)); fi`
+          `if [ "$CODE" != "timeout" ] && [ "$CODE" -ge 100 ] && [ "$CODE" -lt 500 ] 2>/dev/null; then RESP=$((RESP+1)); fi`
         ),
         `if [ "$RESP" -eq ${ports.length} ]; then printf '%s|OK|%s\\n' ${idx} "$RESP"` +
           `; elif [ "$RESP" -gt 0 ]; then printf '%s|WARN|%s\\n' ${idx} "$RESP"` +
@@ -115,13 +115,13 @@ function renderResult(spec: HealthCheckSpec, parsed: ParsedLine): { line: string
 
     case 'pm2': {
       const { status: pmStatus, line } = parsePm2Detail(detail, spec.app);
-      return { line, failed: pmStatus === 'FAIL' };
+      return { line, failed: pmStatus === 'FAIL' || (spec.requireAll === true && pmStatus !== 'OK') };
     }
 
     case 'ports': {
       const total = spec.ports.length;
       if (status === 'OK') return { line: `✅ Backend ports: all ${total} responding`, failed: false };
-      if (status === 'WARN') return { line: `⚠️ Backend ports: ${detail}/${total} responding`, failed: false };
+      if (status === 'WARN') return { line: `⚠️ Backend ports: ${detail}/${total} responding`, failed: spec.requireAll === true };
       return { line: `❌ Backend ports: none responding`, failed: true };
     }
 
@@ -186,5 +186,6 @@ export async function runHealthChecks(
 ): Promise<{ success: boolean; results: string[] }> {
   if (specs.length === 0) return { success: true, results: [] };
   const res = await exec(conn, buildHealthScript(specs));
+  if (res.code !== 0) return { success: false, results: ['❌ Health transport/script failed'] };
   return parseHealthOutput(specs, res.stdout);
 }

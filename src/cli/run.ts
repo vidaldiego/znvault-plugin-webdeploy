@@ -8,6 +8,8 @@ import { purgeCloudflare, verifyVersions } from './cdn-cloudflare.js';
 import { sendWebhook, syncHelp } from './notify.js';
 import { VERSION_VERIFY_CEILING_MS } from './constants.js';
 import { probeVersion } from './http-probe.js';
+import { readFileSync } from 'node:fs';
+import { applyNginx, assertNginxBaseline, checkNginxListeners, digest, readNginxHash, rollbackNginx, type NginxChange } from './nginx.js';
 
 export interface RunDeps {
   exec: Exec;
@@ -29,6 +31,7 @@ export interface RunDeps {
   probeVersion?: typeof probeVersion;
   /** Injectable verification retry ceiling for deterministic tests. */
   versionVerifyCeilingMs?: number;
+  readNginxFile?: (path: string) => string;
 }
 
 export function renderEnvFile(env: Record<string, string>): string {
@@ -40,7 +43,7 @@ export function renderEnvFile(env: Record<string, string>): string {
   return Object.entries(env).map(([k, v]) => `${k}=${v}`).join('\n') + '\n';
 }
 
-async function deployHost(cfg: WebDeployConfig, conn: HostConnection, build: string, deps: RunDeps): Promise<void> {
+async function deployHost(cfg: WebDeployConfig, conn: HostConnection, build: string, deps: RunDeps, nginxContent?: string): Promise<NginxChange | undefined> {
   const tdeps: TransferDeps = { exec: deps.exec, rsync: deps.rsync, log: deps.log };
 
   if (cfg.app) {
@@ -61,6 +64,21 @@ async function deployHost(cfg: WebDeployConfig, conn: HostConnection, build: str
   if (cfg.app) {
     await reloadOrStartPm2(deps.exec, conn, { remotePath: cfg.app.remotePath, app: cfg.app.pm2App, log: deps.log, settleMs: deps.pm2SettleMs });
   }
+  if (cfg.nginx?.config && nginxContent !== undefined) {
+    await checkNginxListeners(deps.exec, conn, nginxContent, cfg.nginx.config);
+    const change = await applyNginx(deps.exec, deps.pipe, conn, cfg.nginx.config, nginxContent);
+    try {
+      // applyNginx already validated/reloaded a changed config. The unchanged
+      // case still reloads after the application/static rollout.
+      if (!change) await reloadNginx(deps.exec, conn);
+      if (await readNginxHash(deps.exec, conn, cfg.nginx.config) !== digest(nginxContent)) throw new Error('nginx post-deploy drift');
+      await checkNginxListeners(deps.exec, conn, nginxContent, cfg.nginx.config);
+      return change;
+    } catch (error) {
+      if (change) await rollbackNginx(deps.exec, conn, cfg.nginx.config, change);
+      throw error;
+    }
+  }
   // Default: reload only when `static` is deployed (nginx serves it directly).
   // An explicit `nginx.reload: true` overrides that and reloads regardless —
   // e.g. an nginx config templated/managed outside of `static` still needs
@@ -68,6 +86,7 @@ async function deployHost(cfg: WebDeployConfig, conn: HostConnection, build: str
   if (cfg.nginx?.reload === true || (cfg.nginx?.reload !== false && !!cfg.static)) {
     await reloadNginx(deps.exec, conn);
   }
+  return undefined;
 }
 
 export async function runDeploy(
@@ -80,6 +99,16 @@ export async function runDeploy(
   const warnings: string[] = [];
   const hosts: HostDeployResult[] = [];
   let abort = false;
+  let mutationAttempted = false;
+  // Freeze the reviewed bytes once, and reject fleet drift BEFORE rsync,
+  // dependency installation, PM2 or any config write on the first host.
+  const managed = cfg.nginx?.config;
+  const nginxContent = managed ? (deps.readNginxFile ?? (p => readFileSync(p, 'utf8')))(managed.localPath) : undefined;
+  if (managed && nginxContent !== undefined) {
+    for (const conn of conns) {
+      assertNginxBaseline(await readNginxHash(deps.exec, conn, managed), nginxContent, managed);
+    }
+  }
 
   for (let i = 0; i < conns.length; i++) {
     const conn = conns[i]!;
@@ -89,9 +118,11 @@ export async function runDeploy(
       continue;
     }
 
+    let nginxChange: NginxChange | undefined;
     try {
       deps.log(`=== Deploying ${conn.host} (${i + 1}/${conns.length}) ===`);
-      await deployHost(cfg, conn, build, deps);
+      mutationAttempted = true;
+      nginxChange = await deployHost(cfg, conn, build, deps, nginxContent);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       deps.log(`[${conn.host}] ❌ Deploy failed: ${message}`);
@@ -101,9 +132,15 @@ export async function runDeploy(
     }
 
     // Health gate (also run on the last host, for the summary)
-    const health = await runHealthChecks(deps.exec, conn, cfg.healthChecks ?? []);
+    const health = await runHealthChecks(deps.exec, conn, cfg.healthChecks ?? []).catch(() => ({ success: false, results: ['❌ Health probe failed'] }));
     hosts.push({ host: conn.host, success: true, healthResults: health.results, healthOk: health.success });
     if (!health.success) {
+      if (nginxChange && managed) {
+        try {
+          await rollbackNginx(deps.exec, conn, managed, nginxChange);
+          warnings.push(`nginx restored on ${conn.host}; application rollback remains a separate recovery step`);
+        } catch (error) { warnings.push((error as Error).message); }
+      }
       warnings.push(`health check failed on ${conn.host}`);
       if (i < conns.length - 1) {
         deps.log(`[${conn.host}] ❌ Health gate failed — aborting remaining hosts.`);
@@ -145,7 +182,7 @@ export async function runDeploy(
   const purgeOk = !cfg.cdn || summary.purge?.ok === true;
   const versionOk = !cfg.verify || summary.verify?.allMatch === true;
   summary.success = hostGatesOk && purgeOk && versionOk;
-  summary.recoveryRequired = anyDeployed && !summary.success;
+  summary.recoveryRequired = mutationAttempted && !summary.success;
 
   // Old assets are the recovery boundary for stale cached HTML and an
   // incomplete rollout. Retire them only after every blocking gate converges.

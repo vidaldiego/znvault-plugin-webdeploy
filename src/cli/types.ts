@@ -3,11 +3,20 @@
 export type HealthCheckSpec =
   | { type: 'systemd'; unit: string }
   | { type: 'http'; url: string; expectStatus?: number }
-  | { type: 'pm2'; app: string }
-  | { type: 'ports'; ports: number[] }
+  | { type: 'pm2'; app: string; requireAll?: boolean }
+  | { type: 'ports'; ports: number[]; requireAll?: boolean }
   | { type: 'file'; path: string }
   | { type: 'disk'; warnAt?: number; failAt?: number }
   | { type: 'memory'; warnAt?: number; failAt?: number };
+
+export interface ManagedNginx {
+  localPath: string;
+  remotePath: string;
+  enabledPath: string;
+  upstream: string;
+  /** Only this explicit predecessor may be replaced; absent means verify-only. */
+  previousSha256?: string;
+}
 
 export interface WebDeployConfig {
   hosts: string[];
@@ -33,7 +42,7 @@ export interface WebDeployConfig {
     remotePath: string;     // e.g. "/var/www/"
     retentionCount?: number; // default 50
   };
-  nginx?: { reload?: boolean }; // default true when `static` present
+  nginx?: { reload?: boolean; config?: ManagedNginx }; // default true when `static` present
   healthChecks?: HealthCheckSpec[];
   cdn?: {
     provider: 'cloudflare';

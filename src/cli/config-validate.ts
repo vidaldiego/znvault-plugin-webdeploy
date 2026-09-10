@@ -1,5 +1,6 @@
 // Path: src/cli/config-validate.ts
 import type { WebDeployConfig } from './types.js';
+import { validateManagedNginx } from './nginx.js';
 
 /**
  * Env keys whose values must be alias: references. Any key matching these
@@ -100,5 +101,12 @@ export function validateDeployConfig(raw: unknown): string[] {
     }
   }
 
+  if (cfg.nginx !== undefined) {
+    if (!isPlainObject(cfg.nginx)) errors.push('nginx must be an object');
+    else if (cfg.nginx.config !== undefined) {
+      try { validateManagedNginx(cfg.nginx.config); } catch (e) { errors.push((e as Error).message); }
+      if (cfg.nginx.reload === false) errors.push('managed nginx requires reload enabled');
+    }
+  }
   return errors;
 }

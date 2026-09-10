@@ -1,5 +1,36 @@
 # @zincapp/znvault-plugin-webdeploy
 
+## 0.3.0: reviewed nginx ownership
+
+`run <name> --config-file <path>` consumes a reviewed repository configuration
+without updating the named config store; relative paths resolve from the working
+directory. The name still identifies the lock and summary.
+
+Optional `nginx.config` accepts `localPath`, `remotePath` (one sites-available
+file), `enabledPath` (the enabled site), `upstream` and optional `previousSha256`.
+Without a predecessor hash it verifies exact bytes only. An explicit reviewed
+predecessor permits replacement; all other drift is fatal. Before any transfer,
+all hosts must pass hash, enabled-site, effective include and syntax checks.
+After app reload, all configured upstreams must accept TCP connections. Managed
+upstreams deliberately support only explicit IPv4 loopback servers, least_conn
+and keepalive; unsupported directives fail closed rather than being guessed.
+
+Approved file changes use stdin, unique staging and backup files, double
+readback, syntax check and graceful reload. Apply/reload/post-host-health failure
+restores that site's predecessor unless concurrent edits make rollback unsafe.
+Application rollback is separate, and incomplete rollouts retain old assets.
+This is not a provisioning command: packages, site files, symlinks and host
+permissions must already exist. Do not put private keys or secrets in this
+versioned configuration.
+
+Use `requireAll: true` on PM2 and ports health specs to make partial failures
+blocking. Transport failures always fail health checks. TCP reachability and
+PM2 online are not substitutes for an authenticated application/PDF acceptance.
+
+Existing configs without `nginx.config` retain the reload-only path. Publishing,
+installation and each production rollout are separate authorization boundaries;
+a package release is not evidence that a particular fleet was commissioned.
+
 Generic web-app deployment plugin for the `znvault` CLI. It deploys static
 assets and/or a Node app to one or more hosts over **rsync + SSH**, using
 short-lived **SSH-CA certificates** minted by ZnVault instead of long-lived

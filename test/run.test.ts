@@ -3,6 +3,7 @@ import { runDeploy, renderEnvFile } from '../src/cli/run.js';
 import type { RunDeps } from '../src/cli/run.js';
 import type { ExecResult, HostConnection, WebDeployConfig } from '../src/cli/types.js';
 import type { probeVersion } from '../src/cli/http-probe.js';
+import { digest } from '../src/cli/nginx.js';
 
 const fakeProbe: typeof probeVersion = async (_host, _path) => ({ ok: true, status: 200, body: '30412' });
 
@@ -57,6 +58,74 @@ function makeDeps(opts: { failHost?: string; nginxDownOn?: string; redact?: (s: 
 }
 
 describe('runDeploy', () => {
+  it('restores an approved nginx change after a failed host health gate and skips the next host', async () => {
+    const { deps, events } = makeDeps({ nginxDownOn: '192.0.2.1' });
+    const content = 'upstream myzn { server 127.0.0.1:3000; }';
+    const before = 'a'.repeat(64);
+    const after = digest(content);
+    const hashes = new Map(conns.map(conn => [conn.host, before]));
+    deps.readNginxFile = () => content;
+    const originalExec = deps.exec;
+    const originalPipe = deps.pipe;
+    deps.exec = async (conn, command) => {
+      if (command.startsWith('sudo -n bash -c') && command.includes('webdeploy-backup')) {
+        expect(hashes.get(conn.host)).toBe(after);
+        events.push(`rollback:${conn.host}`);
+        hashes.set(conn.host, before);
+        return { code: 0, stdout: '', stderr: '' };
+      }
+      if (command.includes('sha256sum')) return { code: 0, stdout: hashes.get(conn.host)!, stderr: '' };
+      return originalExec(conn, command);
+    };
+    deps.pipe = async (conn, command, input) => {
+      if (command === 'sudo -n bash -s') {
+        hashes.set(conn.host, after);
+        return { code: 0, stdout: 'BACKUP=/etc/nginx/sites-available/default.webdeploy-backup.ABC123', stderr: '' };
+      }
+      return originalPipe(conn, command, input);
+    };
+    const managedCfg = { ...cfg, nginx: { config: { localPath: 'unused', remotePath: '/etc/nginx/sites-available/default', enabledPath: '/etc/nginx/sites-enabled/default', upstream: 'myzn', previousSha256: before } } };
+    const result = await runDeploy('prod', managedCfg, conns, deps);
+    expect(result.success).toBe(false);
+    expect(result.recoveryRequired).toBe(true);
+    expect(result.hosts[1]?.skipped).toBe(true);
+    expect(events.filter(e => e.startsWith('rollback:'))).toEqual(['rollback:192.0.2.1']);
+    expect([...hashes.values()]).toEqual([before, before]);
+    expect(result.warnings.join(' ')).toContain('application rollback remains a separate recovery step');
+    expect(events.some(e => e.startsWith('rsync:') && e.includes('192.0.2.2'))).toBe(false);
+  });
+
+  it('rejects drift on the second host before touching either host', async () => {
+    const { deps, events } = makeDeps();
+    const content = 'upstream myzn { server 127.0.0.1:3000; }';
+    deps.readNginxFile = () => content;
+    deps.exec = async (conn, command) => {
+      events.push(`read:${conn.host}:${command}`);
+      return { code: 0, stdout: conn.host.endsWith('.1') ? digest(content) : 'a'.repeat(64), stderr: '' };
+    };
+    const managedCfg = { ...cfg, nginx: { config: { localPath: 'unused', remotePath: '/etc/nginx/sites-available/default', enabledPath: '/etc/nginx/sites-enabled/default', upstream: 'myzn' } } };
+    await expect(runDeploy('prod', managedCfg, conns, deps)).rejects.toThrow(/drift/);
+    expect(events.some(e => e.startsWith('rsync:') || e.startsWith('pipe:'))).toBe(false);
+  });
+
+  it('stops after a missing upstream listener and retains recovery state', async () => {
+    const { deps, events } = makeDeps();
+    const content = 'upstream myzn { server 127.0.0.1:3000; }';
+    deps.readNginxFile = () => content;
+    const original = deps.exec;
+    deps.exec = async (conn, command) => {
+      if (command.includes('sha256sum')) return { code: 0, stdout: digest(content), stderr: '' };
+      if (command.startsWith('node -e')) return { code: 1, stdout: '', stderr: '' };
+      return original(conn, command);
+    };
+    const managedCfg = { ...cfg, nginx: { config: { localPath: 'unused', remotePath: '/etc/nginx/sites-available/default', enabledPath: '/etc/nginx/sites-enabled/default', upstream: 'myzn' } } };
+    const result = await runDeploy('prod', managedCfg, conns, deps);
+    expect(result.success).toBe(false);
+    expect(result.recoveryRequired).toBe(true);
+    expect(result.hosts[1]?.skipped).toBe(true);
+    expect(events.some(e => e.startsWith('rsync:') && e.includes('192.0.2.2'))).toBe(false);
+  });
+
   it('deploys hosts in order, purges, verifies, cleans up — success', async () => {
     const { deps, events } = makeDeps();
     const summary = await runDeploy('prod', cfg, conns, deps);

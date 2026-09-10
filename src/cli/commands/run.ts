@@ -55,9 +55,10 @@ export function assertTransportSafePaths(keyPath: string, certPath: string): voi
 export async function prepareResolvedRun(
   ctx: CLIPluginContext,
   name: string,
-  redactor: Redactor
+  redactor: Redactor,
+  configFile?: string
 ): Promise<{ cfg: WebDeployConfig; conns: HostConnection[]; redactor: Redactor }> {
-  const stored = await getConfig(name);
+  const stored = configFile ? JSON.parse(readFileSync(configFile, 'utf8')) as WebDeployConfig : await getConfig(name);
   const errors = validateDeployConfig(stored);
   if (errors.length > 0) throw new Error(`Invalid config '${name}': ${errors.join('; ')}`);
 
@@ -79,13 +80,14 @@ export function registerRunCommand(webdeploy: Command, ctx: CLIPluginContext): v
     .command('run <config>')
     .description('Run a gated rolling deploy')
     .option('--json', 'Print a machine-readable summary to stdout')
+    .option('--config-file <path>', 'Use the reviewed repository config, without changing the named config store (paths relative to cwd)')
     .option('--dry-run', 'Resolve, validate and print the plan without touching hosts')
     .option('--skip-purge', 'Skip the CDN purge step')
-    .action(async (name: string, options: { json?: boolean; dryRun?: boolean; skipPurge?: boolean }) => {
+    .action(async (name: string, options: { json?: boolean; dryRun?: boolean; skipPurge?: boolean; configFile?: string }) => {
       const redactor = new Redactor();
       try {
         validateRsyncVersion();
-        const { cfg, conns } = await prepareResolvedRun(ctx, name, redactor);
+        const { cfg, conns } = await prepareResolvedRun(ctx, name, redactor, options.configFile);
         if (options.skipPurge) delete cfg.cdn;
 
         if (options.dryRun) {

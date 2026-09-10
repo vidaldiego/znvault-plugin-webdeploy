@@ -95,6 +95,14 @@ const PM2_OK = JSON.stringify([
 ]);
 
 describe('runHealthChecks', () => {
+  it('makes partial ports and PM2 failures blocking when requireAll is selected', () => {
+    expect(parseHealthOutput([{type: 'ports', ports: [3000, 3001], requireAll: true}], '0|WARN|1').success).toBe(false);
+    const partial = JSON.stringify([{name: 'www', pm2_env: {status: 'online'}}, {name: 'www', pm2_env: {status: 'errored'}}]);
+    expect(parseHealthOutput([{type: 'pm2', app: 'www', requireAll: true}], `0|PM2|${partial}`).success).toBe(false);
+  });
+  it('does not accept successful-looking output from a failed transport', async () => {
+    expect((await runHealthChecks(async () => ({code: 1, stdout: '0|OK|active', stderr: ''}), conn, [{type: 'systemd', unit: 'nginx'}])).success).toBe(false);
+  });
   it('passes when everything is healthy', async () => {
     const specs: HealthCheckSpec[] = [
       { type: 'systemd', unit: 'nginx' },
