@@ -28,6 +28,7 @@ function makeDeps(opts: { failHost?: string; nginxDownOn?: string; redact?: (s: 
     permissions: async (_c,_open,_restore,action) => action(),
     exec: async (conn, command): Promise<ExecResult> => {
       events.push(`exec:${conn.host}:${command}`);
+      if (command.includes('mktemp -d /tmp/zn-webdeploy-')) return {code:0,stdout:'/tmp/zn-webdeploy-abcdefghij',stderr:''};
       if (command.includes('pm2 jlist')) return { code: 0, stdout: PM2_OK, stderr: '' };
       if (command.includes('pm2 describe')) return { code: 0, stdout: 'status online', stderr: '' };
       // Batched health script (cfg.healthChecks === [{ type: 'systemd', unit: 'nginx' }]):
@@ -337,4 +338,40 @@ it('does not begin a host mutation with less than the minimum remaining authoriz
   const result=await runDeploy('prod',cfg,conns.map(c=>({...c,certificateExpiresAt:Date.now()+1000})),deps);
   expect(result.success).toBe(false);expect(result.recoveryRequired).toBe(false);
   expect(events.some(e=>e.startsWith('rsync:')||e.startsWith('pipe:')||e.includes('mkdir'))).toBe(false);
+});
+it('checks local receipt before each host and installed bytes before activation; a bad first inventory blocks all activation',async()=>{
+ const {deps,events}=makeDeps();let checks=0;
+ deps.publication={recheck:()=>{checks++;},receipt:{artifact:{artifactSha256:'a'.repeat(64)}}} as never;
+ deps.verifyInventory=async()=>{events.push('inventory');throw Error('installed bytes differ');};
+ const summary=await runDeploy('prod',cfg,conns,deps);
+ expect(checks).toBeGreaterThan(0);expect(summary.success).toBe(false);expect(summary.hosts[1]?.skipped).toBe(true);
+ expect(events).toContain('inventory');expect(events.some(e=>e.includes('pm2 reload')||e.includes('pm2 start')||e.includes('systemctl reload'))).toBe(false);
+});
+it('does not mutate the second host when local receipt bytes changed after the first host',async()=>{
+ const {deps,events}=makeDeps();let checks=0;
+ deps.publication={recheck:()=>{if(++checks>=3)throw Error('local artifact changed');},receipt:{artifact:{artifactSha256:'a'.repeat(64)}}} as never;
+ deps.verifyInventory=async()=>{};
+ const summary=await runDeploy('prod',cfg,conns,deps);
+ expect(summary.hosts[0]?.artifactVerified).toBe(true);expect(summary.success).toBe(false);expect(events.some(e=>e.startsWith('rsync:')&&e.includes('192.0.2.2'))).toBe(false);
+});
+it('an app-only digest mismatch blocks dependency scripts and all static publication',async()=>{
+ const {deps,events}=makeDeps();deps.publication={recheck:()=>{},receipt:{artifact:{artifactSha256:'a'.repeat(64)}}} as never;
+ deps.verifyInventory=async(_conn,options)=>{if(options?.scope==='app')throw Error('package bytes differ');};
+ const summary=await runDeploy('prod',{...cfg,app:{...cfg.app!,yarnVersion:'4.2.1'}},conns,deps);
+ expect(summary.success).toBe(false);expect(summary.hosts[1]?.skipped).toBe(true);
+ expect(events.some(e=>e.includes('corepack')||e.includes('install --immutable')||e.includes('mktemp -d /tmp/zn-webdeploy-')||e.includes('pm2 reload'))).toBe(false);
+});
+it('rejects a missing Python inventory runtime before transferring any host',async()=>{
+ const {deps,events}=makeDeps();const exec=deps.exec;deps.publication={recheck:()=>{},receipt:{artifact:{artifactSha256:'a'.repeat(64)}}} as never;
+ deps.exec=async(conn,command)=>command.startsWith('python3 -c')?{code:127,stdout:'',stderr:'missing'}:exec(conn,command);
+ await expect(runDeploy('prod',cfg,conns,deps)).rejects.toThrow(/Python inventory runtime/);
+ expect(events.some(e=>e.startsWith('rsync:')||e.startsWith('pipe:'))).toBe(false);
+});
+it('a bad staged inventory preserves live publication and blocks the second host',async()=>{
+ const {deps,events}=makeDeps();deps.publication={recheck:()=>{},receipt:{artifact:{artifactSha256:'a'.repeat(64)}}} as never;
+ deps.verifyInventory=async(_conn,options)=>{if(options?.staticRoot)throw Error('staged static bytes differ');};
+ const summary=await runDeploy('prod',cfg,conns,deps);
+ expect(summary.success).toBe(false);expect(summary.hosts[1]?.skipped).toBe(true);
+ expect(events.some(e=>e.includes('pm2 reload')||e.includes('pm2 start')||e.startsWith('rsync:ops@192.0.2.1:/var/www/'))).toBe(false);
+ expect(events.some(e=>e.startsWith('rsync:')&&e.includes('192.0.2.2'))).toBe(false);
 });

@@ -76,6 +76,9 @@ export interface TransferStats { transferredBytes?: number }
 export interface PhaseTiming extends TransferStats { phase: string; host?: string; durationMs: number; success: boolean }
 
 export interface HostDeployResult {
+  artifactVerified?: boolean;
+  artifactSha256?: string;
+  nginxOk?: boolean;
   durationMs?: number;
   transferredBytes?: number;
   host: string;
@@ -87,6 +90,7 @@ export interface HostDeployResult {
 }
 
 export interface RunSummary {
+  deploymentReceipt?: { path: string; sha256: string };
   timings?: PhaseTiming[];
   config: string;
   build: string;

@@ -1,5 +1,44 @@
 # @zincapp/znvault-plugin-webdeploy
 
+## 0.5.0: mandatory publication and deployment receipts
+
+Both `run` and `verify` require `--config-file <path>` and `--receipt <path>`.
+The named configuration still identifies the lock and summary; publication uses
+the explicitly reviewed file. This is a breaking change for older direct calls.
+The web release rail generates the publication receipt after exact-candidate
+validation. It binds a clean source commit, build, complete staged file inventory,
+configuration and validation fingerprints. A mutating run requires validation less
+than 24 hours old; read-only verification may inspect older evidence. Future dates,
+changed inputs, missing/extra files, hidden exclusions and symlinks are rejected.
+These unsigned receipts prove integrity within a trusted workstation workflow;
+they are not signatures or authenticated human approval.
+
+Publication requires app, static, managed nginx, health and version configuration.
+App exclusions must be exact runtime/dependency paths, not wildcard patterns.
+The plugin checks Python availability and destination paths before transfer,
+then verifies app hashes before dependency scripts can execute. Selected/shared
+static bytes are transferred once to a private temporary directory outside the
+webroot, hashed before local promotion, and checked again in the installed tree
+before PM2 activation. Missing, extra, changed or symlinked managed files block
+activation and later hosts. Old numeric builds and explicitly excluded runtime
+files are not recursively hashed. Verification sends manifests over SSH stdin.
+
+Each valid invocation reserves a unique UUID before secret resolution. The caller
+may pass `--attempt-id <uuid>`; otherwise the CLI generates one. Results are written
+atomically with private permissions and fsync under
+`.release-artifacts/webdeploy-results/<uuid>.json`, including failed/partial attempts.
+The JSON summary includes `deploymentReceipt:{path,sha256}`. A result binds source,
+build, artifact and publication digest to every configured host and the health,
+version, nginx and CDN gates. It contains no resolved secrets or raw error output.
+A result-writing failure cannot produce successful completion. The web consumer
+requires the current caller UUID and strict invocation times, so an earlier result
+cannot satisfy a later attempt. `--skip-purge` is rejected.
+
+`verify` hashes installed bytes and checks the remote gates without mutating hosts;
+its result is persisted locally. A deploy result does not prove completion of the
+web rail's later print, SIF or release-tag steps. Publication/installation of this
+plugin and a production rollout remain distinct operations.
+
 ## 0.3.0: reviewed nginx ownership
 
 `run <name> --config-file <path>` consumes a reviewed repository configuration
@@ -27,7 +66,8 @@ Use `requireAll: true` on PM2 and ports health specs to make partial failures
 blocking. Transport failures always fail health checks. TCP reachability and
 PM2 online are not substitutes for an authenticated application/PDF acceptance.
 
-Existing configs without `nginx.config` retain the reload-only path. Publishing,
+In 0.3/0.4, configs without `nginx.config` retained a reload-only path; 0.5 publication
+requires managed nginx evidence as described above. Publishing,
 installation and each production rollout are separate authorization boundaries;
 a package release is not evidence that a particular fleet was commissioned.
 
@@ -44,26 +84,27 @@ plugin-loader mechanism.
 
 ## What it does
 
-A single `znvault webdeploy run <config>` invocation:
+A single `znvault webdeploy run <config> --config-file webdeploy.config.json --receipt <receipt.json>` invocation:
 
-1. Loads a named deploy config and resolves all `alias:` secret references
-   from ZnVault (in memory only).
+1. Validates the receipt and explicit config before resolving `alias:` secret
+   references from ZnVault (in memory only).
 2. Ensures a usable SSH certificate exists (signs a new short-TTL one via
    `POST /v1/ssh/sign` if the cached one is missing/expiring/missing the
    right principal).
 3. For each host, in order, gated:
-   - rsyncs the app directory (if `app` is configured),
+   - verifies destination paths, rsyncs the app directory and hashes the installed
+     app before executing dependency scripts,
    - renders `.env` and any extra `app.files` from resolved secrets and
      writes them to the remote host over SSH **stdin** (mode 0600),
-   - runs `corepack use yarn@<version> && yarn install --immutable` (if `app.yarnVersion`
+   - runs `COREPACK_ENABLE_AUTO_PIN=0 COREPACK_DEFAULT_TO_LATEST=0 corepack yarn@<version> install --immutable` (if `app.yarnVersion`
      is set), **skipped if the remote `package.json` + `yarn.lock` hash
      matches the previous stamp file AND `node_modules` exists** — fail-safe,
      any missing/corrupt stamp/hash forces a fresh install, while any attempted
      lockfile rewrite fails the deploy,
-   - rsyncs static assets in two phases: a new versioned directory first
-     (with scope-limited `chown`/`chmod -R` to the new dir only), then an
-     atomic, `--delay-updates` switchover of shared/HTML files (with
-     scope-limited `chown`/`chmod` non-recursive to the webroot itself only),
+   - transfers static assets once to private staging and verifies their hashes,
+     then promotes them locally on the host: the selected versioned directory
+     followed by shared/HTML files using `--delay-updates`, with existing scoped
+     permission restoration; verifies the final installed inventory,
    - reloads (or first-starts) the app under PM2 with a zero-downtime
      `pm2 reload`, **polls `pm2 describe` every 250ms up to a 2-second
      ceiling** instead of a fixed sleep,
@@ -79,6 +120,7 @@ A single `znvault webdeploy run <config>` invocation:
 5. Only after every host, health check, CDN purge and version check succeeds,
    cleans up old versioned build directories (retention count). Help sync and
    webhook notification remain best effort.
+6. Persists the identity-bound deployment result before reporting success.
 
 If any blocking post-deploy gate fails after a host changed, the command exits
 non-zero, marks the summary `recoveryRequired`, and retains old versioned assets
@@ -130,6 +172,8 @@ the host CLI provides `commander` and the plugin context at runtime).
 ## Requirements
 
 - Node >= 18.
+- Remote Python >= 3.8 with `O_NOFOLLOW`, bash and rsync; private staging uses
+  temporary disk space for one selected/shared static tree per active host.
 - System **OpenSSH** (`ssh`) on PATH.
 - **GNU rsync >= 3.1.0** on PATH. macOS ships `openrsync` under the `rsync`
   name, which this plugin explicitly rejects (checked by `znvault webdeploy
@@ -177,12 +221,12 @@ local config store, never in this repo.
   // (e.g. a "shared/version" file written by your build).
   "versionFile": "shared/version",
 
-  // Optional — Node app deployment. Omit if this host only serves static assets.
+  // Required for receipt-backed publication.
   "app": {
     "localPath": "deploy",          // local staged dir to rsync (staging it is the caller's job)
     "remotePath": "zincapp-ts",     // remote path, relative to the SSH user's home
     "pm2App": "www",                // PM2 app name (ecosystem.config.js entry)
-    "exclude": ["*.log"],           // optional rsync --exclude patterns
+    "exclude": ["node_modules", "out.log", "error.log"], // exact runtime paths
     // Rendered to <remotePath>/.env. Values are `alias:` refs or plain
     // non-secret literals (e.g. NODE_ENV=production). Keys that LOOK secret
     // (KEY/TOKEN/SECRET/PASSWORD/PASSWD/CREDENTIAL, case-insensitive) MUST
@@ -200,7 +244,7 @@ local config store, never in this repo.
     "yarnVersion": "4.9.1"   // corepack pin; omit to skip corepack/yarn install entirely
   },
 
-  // Optional — static asset deployment. Omit if this is an app-only host.
+  // Required for receipt-backed publication.
   // localPath/remotePath MUST end with '/' (validated).
   "static": {
     "localPath": "public/",
@@ -208,9 +252,16 @@ local config store, never in this repo.
     "retentionCount": 50     // optional, default 50 — old versioned dirs kept
   },
 
-  "nginx": { "reload": true },  // optional; defaults to true whenever `static` is present
+  "nginx": {
+    "config": {
+      "localPath": "ops/nginx/default.conf",
+      "remotePath": "/etc/nginx/sites-available/default",
+      "enabledPath": "/etc/nginx/sites-enabled/default",
+      "upstream": "www"
+    }
+  },
 
-  // Optional health checks, run after each host deploys (and used
+  // Required publication health checks, run after each host deploys (and used
   // standalone by `check`). Any of 7 spec types, any number, any mix:
   "healthChecks": [
     { "type": "systemd", "unit": "myapp.service" },
@@ -230,7 +281,7 @@ local config store, never in this repo.
     "purge": "everything"   // or an array of specific URLs
   },
 
-  // Optional post-deploy version verification (also powers `status`).
+  // Required publication version verification (also powers `status`).
   "verify": {
     "versionPath": "/version",
     "hostHeader": "app.example.com"   // optional Host header override
@@ -337,17 +388,15 @@ znvault webdeploy config import <name> <file>    Import + validate a config from
 ### `run`
 
 ```
-znvault webdeploy run <config> [--json] [--dry-run] [--skip-purge]
+znvault webdeploy run <config> --config-file <config.json> --receipt <receipt.json> [--attempt-id <uuid>] [--json] [--dry-run]
 ```
 
-- `--dry-run` — resolves secrets, signs/validates the SSH cert, and prints
-  the deploy plan (hosts, app remote path/PM2 app, static config, CDN purge
-  mode) without touching any host. All secret values are redacted from the
-  printed plan.
+- `--dry-run` — validates local publication evidence and prints config/build/artifact
+  identity without resolving secrets, obtaining certificates or touching hosts.
 - `--json` — prints the machine-readable `RunSummary` instead of the
   human-readable summary lines.
-- `--skip-purge` — drops the `cdn` section for this run (no Cloudflare
-  purge).
+- `--attempt-id` — binds the result to the caller's fresh UUID; reuse is rejected.
+- `--skip-purge` — rejected for publication; configured CDN gates are mandatory.
 
 A run acquires a **per-config lock** (see [Locking](#locking)) before
 touching any host, so two overlapping `run`s against the same config name
@@ -374,11 +423,13 @@ URL's hostname, making vhost-routed version checks impossible).
 ## Exit codes
 
 `run` exits zero only when every configured host deployment and health gate
-succeeds, the configured CDN purge succeeds, and every configured version
-probe serves the requested build. If at least one host changed before a gate
+succeeds, all artifact checks pass, the configured CDN purge succeeds, every
+configured version probe serves the requested build, and the result is persisted.
+If at least one host changed before a gate
 failed, the JSON summary sets `recoveryRequired: true`; old versioned assets
-are retained and the human summary says recovery is required. Cleanup errors
-and optional notification/help-sync failures remain non-blocking.
+are retained and the human summary says recovery is required. Old-build cleanup
+and optional notification/help-sync failures remain non-blocking. Private staging
+cleanup and result persistence failures block successful completion.
 
 `check` exits non-zero when config validation, version, secret resolution/cert
 signing, SSH reachability, or a health check itself fails. Soft disk/memory
@@ -438,7 +489,7 @@ secrets, redaction, stdin-piped file writes) **or the result contract**
 ## Release transport and verification (v0.4.0)
 
 ```bash
-znvault webdeploy verify zn-web-prod --config-file release/webdeploy.production.json --expected-build 30542 --json
+znvault webdeploy verify zn-web-prod --config-file webdeploy.config.json --receipt .release-artifacts/publication.json --expected-build 30542 --json
 ```
 
 `verify` returns zero only when **every configured host** passes its health

@@ -1,6 +1,21 @@
 // Path: src/cli/run.ts
-import type { Exec, ExecPipe, HostConnection, HostDeployResult, RunSummary, WebDeployConfig, TransferStats } from './types.js';
-import { syncAppDir, installAppDeps, deployStatic, cleanupOldBuilds, type TransferDeps } from './transfer.js';
+import type {
+  Exec,
+  ExecPipe,
+  HostConnection,
+  HostDeployResult,
+  RunSummary,
+  WebDeployConfig,
+  TransferStats,
+} from './types.js';
+import {
+  syncAppDir,
+  installAppDeps,
+  deployStatic,
+  stageAndPromoteStatic,
+  cleanupOldBuilds,
+  type TransferDeps,
+} from './transfer.js';
 import { writeRemoteFileIfChanged } from './remote-files.js';
 import { reloadOrStartPm2, reloadNginx } from './pm2.js';
 import { runHealthChecks } from './health.js';
@@ -9,11 +24,24 @@ import { sendWebhook, syncHelp } from './notify.js';
 import { VERSION_VERIFY_CEILING_MS, HOST_AUTHORIZATION_MARGIN_MS } from './constants.js';
 import { probeVersion } from './http-probe.js';
 import type { PermissionSession } from './ssh-exec.js';
+import type { ValidatedPublication } from './publication.js';
+import { execOrThrow } from './ssh-exec.js';
+import { verifyRemoteInventory, type RemoteInventoryOptions } from './remote-inventory.js';
 import { Timings } from './timing.js';
 import { readFileSync } from 'node:fs';
-import { applyNginx, assertNginxBaseline, checkNginxListeners, digest, readNginxHash, rollbackNginx, type NginxChange } from './nginx.js';
+import {
+  applyNginx,
+  assertNginxBaseline,
+  checkNginxListeners,
+  digest,
+  readNginxHash,
+  rollbackNginx,
+  type NginxChange,
+} from './nginx.js';
 
 export interface RunDeps {
+  publication?: ValidatedPublication;
+  verifyInventory?: (conn: HostConnection, options?: RemoteInventoryOptions) => Promise<void>;
   permissions?: PermissionSession;
   exec: Exec;
   pipe: ExecPipe;
@@ -40,22 +68,53 @@ export interface RunDeps {
 export function renderEnvFile(env: Record<string, string>): string {
   for (const [k, v] of Object.entries(env)) {
     if (v.includes('\n')) {
-      throw new Error(`.env value for key '${k}' contains a newline, which would corrupt the rendered .env file`);
+      throw new Error(
+        `.env value for key '${k}' contains a newline, which would corrupt the rendered .env file`
+      );
     }
   }
-  return Object.entries(env).map(([k, v]) => `${k}=${v}`).join('\n') + '\n';
+  return (
+    Object.entries(env)
+      .map(([k, v]) => `${k}=${v}`)
+      .join('\n') + '\n'
+  );
 }
 
-async function deployHost(cfg: WebDeployConfig, conn: HostConnection, build: string, deps: RunDeps, timing: Timings, nginxContent?: string): Promise<NginxChange | undefined> {
+async function deployHost(
+  cfg: WebDeployConfig,
+  conn: HostConnection,
+  build: string,
+  deps: RunDeps,
+  timing: Timings,
+  nginxContent?: string,
+  inventoryVerified?: () => void
+): Promise<NginxChange | undefined> {
   const measure = <T>(phase: string, fn: () => Promise<T>) => timing.measure(phase, conn.host, fn);
-  const tdeps: TransferDeps = { permissions: deps.permissions, exec: deps.exec, rsync: args => measure('rsync', () => deps.rsync(args)), log: deps.log };
+  const tdeps: TransferDeps = {
+    permissions: deps.permissions,
+    exec: deps.exec,
+    rsync: (args) => measure('rsync', () => deps.rsync(args)),
+    log: deps.log,
+  };
 
   if (cfg.app) {
     await measure('app-sync', () => syncAppDir(tdeps, conn, cfg));
+    if (deps.publication)
+      await measure('installed-app-inventory', () =>
+        deps.verifyInventory
+          ? deps.verifyInventory(conn, { scope: 'app' })
+          : verifyRemoteInventory(deps.pipe, conn, deps.publication!, { scope: 'app' })
+      );
     // Rendered files must exist BEFORE yarn install: .yarnrc.yml carries the
     // registry tokens the install needs (rsync just shipped a token-less tree).
     if (cfg.app.env) {
-      await writeRemoteFileIfChanged(deps.exec, deps.pipe, conn, `${cfg.app.remotePath}/.env`, renderEnvFile(cfg.app.env));
+      await writeRemoteFileIfChanged(
+        deps.exec,
+        deps.pipe,
+        conn,
+        `${cfg.app.remotePath}/.env`,
+        renderEnvFile(cfg.app.env)
+      );
     }
     for (const [file, content] of Object.entries(cfg.app.files ?? {})) {
       await writeRemoteFileIfChanged(deps.exec, deps.pipe, conn, `${cfg.app.remotePath}/${file}`, content);
@@ -63,19 +122,43 @@ async function deployHost(cfg: WebDeployConfig, conn: HostConnection, build: str
     await measure('dependencies', () => installAppDeps(tdeps, conn, cfg));
   }
 
-  await measure('static', () => deployStatic(tdeps, conn, cfg, build));
+  if (deps.publication) {
+    await measure('static-publication', () =>
+      stageAndPromoteStatic(tdeps, conn, cfg, build, async (staticRoot) => {
+        if (staticRoot) deps.publication!.recheck();
+        await measure(staticRoot ? 'staged-inventory' : 'installed-inventory', () =>
+          deps.verifyInventory
+            ? deps.verifyInventory(conn, { staticRoot })
+            : verifyRemoteInventory(deps.pipe, conn, deps.publication!, { staticRoot })
+        );
+        if (!staticRoot) inventoryVerified?.();
+      })
+    );
+  } else {
+    await measure('static', () => deployStatic(tdeps, conn, cfg, build));
+  }
 
   if (cfg.app) {
-    await measure('pm2', () => reloadOrStartPm2(deps.exec, conn, { remotePath: cfg.app!.remotePath, app: cfg.app!.pm2App, log: deps.log, settleMs: deps.pm2SettleMs }));
+    await measure('pm2', () =>
+      reloadOrStartPm2(deps.exec, conn, {
+        remotePath: cfg.app!.remotePath,
+        app: cfg.app!.pm2App,
+        log: deps.log,
+        settleMs: deps.pm2SettleMs,
+      })
+    );
   }
   if (cfg.nginx?.config && nginxContent !== undefined) {
     await checkNginxListeners(deps.exec, conn, nginxContent, cfg.nginx.config);
-    const change = await measure('nginx', () => applyNginx(deps.exec, deps.pipe, conn, cfg.nginx!.config!, nginxContent));
+    const change = await measure('nginx', () =>
+      applyNginx(deps.exec, deps.pipe, conn, cfg.nginx!.config!, nginxContent)
+    );
     try {
       // applyNginx already validated/reloaded a changed config. The unchanged
       // case still reloads after the application/static rollout.
       if (!change) await reloadNginx(deps.exec, conn);
-      if (await readNginxHash(deps.exec, conn, cfg.nginx.config) !== digest(nginxContent)) throw new Error('nginx post-deploy drift');
+      if ((await readNginxHash(deps.exec, conn, cfg.nginx.config)) !== digest(nginxContent))
+        throw new Error('nginx post-deploy drift');
       await checkNginxListeners(deps.exec, conn, nginxContent, cfg.nginx.config);
       return change;
     } catch (error) {
@@ -108,11 +191,27 @@ export async function runDeploy(
   // Freeze the reviewed bytes once, and reject fleet drift BEFORE rsync,
   // dependency installation, PM2 or any config write on the first host.
   const managed = cfg.nginx?.config;
-  const nginxContent = managed ? (deps.readNginxFile ?? (p => readFileSync(p, 'utf8')))(managed.localPath) : undefined;
+  const nginxContent = managed
+    ? (deps.readNginxFile ?? ((p) => readFileSync(p, 'utf8')))(managed.localPath)
+    : undefined;
   if (managed && nginxContent !== undefined) {
     for (const conn of conns) {
-      await timing.measure('nginx-baseline', conn.host, async () => { assertNginxBaseline(await readNginxHash(deps.exec, conn, managed), nginxContent, managed); });
+      await timing.measure('nginx-baseline', conn.host, async () => {
+        assertNginxBaseline(await readNginxHash(deps.exec, conn, managed), nginxContent, managed);
+      });
     }
+  }
+
+  if (deps.publication) {
+    for (const conn of conns)
+      await timing.measure('inventory-runtime', conn.host, () =>
+        execOrThrow(
+          deps.exec,
+          conn,
+          `python3 -c 'import hashlib,json,os,stat,sys; assert sys.version_info >= (3,8); assert hasattr(os,"O_NOFOLLOW")'`,
+          'Python inventory runtime'
+        )
+      );
   }
 
   for (let i = 0; i < conns.length; i++) {
@@ -125,28 +224,67 @@ export async function runDeploy(
 
     const hostStart = performance.now();
     let nginxChange: NginxChange | undefined;
+    let artifactVerified = false;
     try {
       deps.log(`=== Deploying ${conn.host} (${i + 1}/${conns.length}) ===`);
-      if (conn.certificateExpiresAt !== undefined && conn.certificateExpiresAt - Date.now() < HOST_AUTHORIZATION_MARGIN_MS) throw new Error('Insufficient remaining SSH authorization to begin this host');
+      if (
+        conn.certificateExpiresAt !== undefined &&
+        conn.certificateExpiresAt - Date.now() < HOST_AUTHORIZATION_MARGIN_MS
+      )
+        throw new Error('Insufficient remaining SSH authorization to begin this host');
+      deps.publication?.recheck();
       mutationAttempted = true;
-      nginxChange = await timing.measure('host-deploy', conn.host, () => deployHost(cfg, conn, build, deps, timing, nginxContent));
+      nginxChange = await timing.measure('host-deploy', conn.host, () =>
+        deployHost(cfg, conn, build, deps, timing, nginxContent, () => {
+          artifactVerified = true;
+        })
+      );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       deps.log(`[${conn.host}] ❌ Deploy failed: ${message}`);
-      hosts.push({ host: conn.host, success: false, error: message, healthResults: [], healthOk: false, durationMs: performance.now() - hostStart });
+      hosts.push({
+        host: conn.host,
+        success: false,
+        error: message,
+        artifactVerified,
+        artifactSha256: artifactVerified ? deps.publication?.receipt.artifact.artifactSha256 : undefined,
+        nginxOk: false,
+        healthResults: [],
+        healthOk: false,
+        durationMs: performance.now() - hostStart,
+      });
       abort = true;
       continue;
     }
 
     // Health gate (also run on the last host, for the summary)
-    const health = await timing.measure('health', conn.host, () => runHealthChecks(deps.exec, conn, cfg.healthChecks ?? []).catch(() => ({ success: false, results: ['❌ Health probe failed'] })));
-    hosts.push({ host: conn.host, success: true, healthResults: health.results, healthOk: health.success, durationMs: performance.now() - hostStart });
+    const health = await timing.measure('health', conn.host, () =>
+      runHealthChecks(deps.exec, conn, cfg.healthChecks ?? []).catch(() => ({
+        success: false,
+        results: ['❌ Health probe failed'],
+      }))
+    );
+    hosts.push({
+      host: conn.host,
+      success: true,
+      artifactVerified,
+      artifactSha256: artifactVerified ? deps.publication?.receipt.artifact.artifactSha256 : undefined,
+      nginxOk: !!managed,
+      healthResults: health.results,
+      healthOk: health.success,
+      durationMs: performance.now() - hostStart,
+    });
     if (!health.success) {
       if (nginxChange && managed) {
         try {
+          hosts.at(-1)!.nginxOk = false;
           await rollbackNginx(deps.exec, conn, managed, nginxChange);
-          warnings.push(`nginx restored on ${conn.host}; application rollback remains a separate recovery step`);
-        } catch (error) { warnings.push((error as Error).message); }
+          warnings.push(
+            `nginx restored on ${conn.host}; application rollback remains a separate recovery step`
+          );
+        } catch (error) {
+          warnings.push((error as Error).message);
+        }
       }
       warnings.push(`health check failed on ${conn.host}`);
       if (i < conns.length - 1) {
@@ -166,31 +304,39 @@ export async function runDeploy(
   };
 
   for (const host of hosts) {
-    const measured = timing.entries.filter(t => t.host === host.host && t.phase === 'rsync' && t.transferredBytes !== undefined);
-    if (measured.length) host.transferredBytes = measured.reduce((total, t) => total + t.transferredBytes!, 0);
+    const measured = timing.entries.filter(
+      (t) => t.host === host.host && t.phase === 'rsync' && t.transferredBytes !== undefined
+    );
+    if (measured.length)
+      host.transferredBytes = measured.reduce((total, t) => total + t.transferredBytes!, 0);
   }
-  const anyDeployed = hosts.some(h => h.success);
+  const anyDeployed = hosts.some((h) => h.success);
   if (anyDeployed) {
     if (cfg.cdn) {
-      summary.purge = await timing.measure('cdn-purge', undefined, () => purgeCloudflare(deps.fetchImpl, cfg.cdn!));
+      summary.purge = await timing.measure('cdn-purge', undefined, () =>
+        purgeCloudflare(deps.fetchImpl, cfg.cdn!)
+      );
       if (!summary.purge.ok) warnings.push(`CDN purge failed: ${summary.purge.detail ?? ''}`);
     }
     if (cfg.verify) {
-      summary.verify = await timing.measure('version', undefined, () => verifyVersions(
-        deps.probeVersion ?? probeVersion,
-        hosts.filter(h => h.success).map(h => h.host),
-        {
-          expected: build,
-          versionPath: cfg.verify!.versionPath,
-          hostHeader: cfg.verify!.hostHeader,
-          retryCeilingMs: deps.versionVerifyCeilingMs ?? VERSION_VERIFY_CEILING_MS,
-        }
-      ));
-      if (summary.verify && !summary.verify.allMatch) warnings.push('version verification mismatch on at least one host');
+      summary.verify = await timing.measure('version', undefined, () =>
+        verifyVersions(
+          deps.probeVersion ?? probeVersion,
+          hosts.filter((h) => h.success).map((h) => h.host),
+          {
+            expected: build,
+            versionPath: cfg.verify!.versionPath,
+            hostHeader: cfg.verify!.hostHeader,
+            retryCeilingMs: deps.versionVerifyCeilingMs ?? VERSION_VERIFY_CEILING_MS,
+          }
+        )
+      );
+      if (summary.verify && !summary.verify.allMatch)
+        warnings.push('version verification mismatch on at least one host');
     }
   }
 
-  const hostGatesOk = hosts.length === conns.length && hosts.every(h => h.success && h.healthOk);
+  const hostGatesOk = hosts.length === conns.length && hosts.every((h) => h.success && h.healthOk);
   const purgeOk = !cfg.cdn || summary.purge?.ok === true;
   const versionOk = !cfg.verify || summary.verify?.allMatch === true;
   summary.success = hostGatesOk && purgeOk && versionOk;
@@ -199,9 +345,14 @@ export async function runDeploy(
   // Old assets are the recovery boundary for stale cached HTML and an
   // incomplete rollout. Retire them only after every blocking gate converges.
   if (anyDeployed && summary.success) {
-    const tdeps: TransferDeps = { permissions: deps.permissions, exec: deps.exec, rsync: deps.rsync, log: deps.log };
+    const tdeps: TransferDeps = {
+      permissions: deps.permissions,
+      exec: deps.exec,
+      rsync: deps.rsync,
+      log: deps.log,
+    };
     for (const h of hosts) {
-      const conn = conns.find(c => c.host === h.host)!;
+      const conn = conns.find((c) => c.host === h.host)!;
       try {
         await timing.measure('cleanup', conn.host, () => cleanupOldBuilds(tdeps, conn, cfg));
       } catch (err) {
@@ -209,11 +360,17 @@ export async function runDeploy(
       }
     }
   } else if (summary.recoveryRequired) {
-    warnings.push('deployment changed at least one host but did not pass every gate; old builds were retained for recovery');
+    warnings.push(
+      'deployment changed at least one host but did not pass every gate; old builds were retained for recovery'
+    );
   }
 
-  if (cfg.notify?.helpSync) await timing.measure('help', undefined, () => syncHelp(deps.fetchImpl, cfg.notify!.helpSync!, deps.log));
-  if (cfg.notify?.webhook) await timing.measure('webhook', undefined, () => sendWebhook(deps.fetchImpl, cfg.notify!.webhook!, summary, deps.redact));
+  if (cfg.notify?.helpSync)
+    await timing.measure('help', undefined, () => syncHelp(deps.fetchImpl, cfg.notify!.helpSync!, deps.log));
+  if (cfg.notify?.webhook)
+    await timing.measure('webhook', undefined, () =>
+      sendWebhook(deps.fetchImpl, cfg.notify!.webhook!, summary, deps.redact)
+    );
 
   return summary;
 }

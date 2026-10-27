@@ -35,7 +35,7 @@ describe('syncAppDir', () => {
     expect(rsync).toContain('--exclude=node_modules');
     expect(rsync.at(-2)).toBe('deploy/');
     expect(rsync.at(-1)).toBe('ops@192.0.2.1:zincapp-ts/');
-    expect(h.execCalls.some(c => c.includes('yarn install'))).toBe(false);
+    expect(h.execCalls.some(c => c.includes('install --immutable'))).toBe(false);
   });
 
   it('does NOT touch yarn.lock (QW4 — the touch defeated yarn\'s mtime shortcut)', async () => {
@@ -75,8 +75,8 @@ describe('installAppDeps', () => {
   it('pins yarn via corepack then installs without changing the accepted lockfile', async () => {
     const h = harness();
     await installAppDeps(h.deps, conn, cfg);
-    expect(h.execCalls.some(c => c.includes('corepack use yarn@4.9.1'))).toBe(true);
-    expect(h.execCalls.some(c => c.includes('yarn install --immutable'))).toBe(true);
+    expect(h.execCalls.some(c => c.includes('corepack yarn@4.9.1'))).toBe(true);
+    expect(h.execCalls.some(c => c.includes('install --immutable'))).toBe(true);
   });
 });
 
@@ -108,7 +108,7 @@ describe('installAppDeps gating', () => {
       rsync: async () => {}, log: () => {},
     };
     await installAppDeps(deps as never, gatingConn as never, gatingCfg);
-    expect(calls.some(c => c.includes('yarn install'))).toBe(false);
+    expect(calls.some(c => c.includes('install --immutable'))).toBe(false);
   });
 
   it('installs and writes the stamp when node_modules is absent', async () => {
@@ -124,7 +124,7 @@ describe('installAppDeps gating', () => {
       rsync: async () => {}, log: () => {},
     };
     await installAppDeps(deps as never, gatingConn as never, gatingCfg);
-    expect(calls.some(c => c.includes('yarn install'))).toBe(true);
+    expect(calls.some(c => c.includes('install --immutable'))).toBe(true);
     expect(calls.some(c => c.includes('.deploy-install-stamp') && (c.includes('>') || c.includes('cat >')))).toBe(true);
   });
 
@@ -153,7 +153,7 @@ describe('installAppDeps gating', () => {
       rsync: async () => {}, log: () => {},
     };
     await installAppDeps(firstDeps as never, gatingConn as never, gatingCfg);
-    expect(callsFirst.some(c => c.includes('yarn install'))).toBe(true);
+    expect(callsFirst.some(c => c.includes('install --immutable'))).toBe(true);
     expect(writtenStamp).not.toBeNull();
 
     const callsSecond: string[] = [];
@@ -168,7 +168,7 @@ describe('installAppDeps gating', () => {
       rsync: async () => {}, log: () => {},
     };
     await installAppDeps(secondDeps as never, gatingConn as never, gatingCfg);
-    expect(callsSecond.some(c => c.includes('yarn install'))).toBe(false);
+    expect(callsSecond.some(c => c.includes('install --immutable'))).toBe(false);
   });
 });
 

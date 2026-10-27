@@ -49,3 +49,7 @@ it('does not invoke nginx syntax commands that can open/create configured log fi
   await verifyDeploy('prod',cfg,conns,'30542',{exec:async(_c,cmd)=>{commands.push(cmd);return {code:0,stdout:cmd.includes('sha256sum')?digest(content):cmd.includes('node -e')?'':'0|OK|exists',stderr:''};},readNginxFile:()=>content,probeVersion:async()=>({ok:true,status:200,body:'30542'}),versionVerifyCeilingMs:0});
   expect(commands.some(c=>/nginx -[tT]/.test(c))).toBe(false);
 });
+it('requires explicit receipt and reviewed config on both publishing commands',()=>{
+ const command=new Command();registerAllCommands(command,{} as CLIPluginContext);
+ for(const name of ['run','verify'])for(const option of ['--receipt','--config-file'])expect(command.commands.find(c=>c.name()===name)?.options.find(o=>o.long===option)?.mandatory).toBe(true);
+});

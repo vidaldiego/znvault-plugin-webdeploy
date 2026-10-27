@@ -2,7 +2,13 @@ import { lstatSync, readdirSync, realpathSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 // Path: src/cli/transfer.ts
 import type { Exec, HostConnection, WebDeployConfig, TransferStats } from './types.js';
-import { buildRsyncArgs, execOrThrow, sshTransportString, sshPermissionSession, type PermissionSession } from './ssh-exec.js';
+import {
+  buildRsyncArgs,
+  execOrThrow,
+  sshTransportString,
+  sshPermissionSession,
+  type PermissionSession,
+} from './ssh-exec.js';
 import { DEFAULT_RETENTION_COUNT } from './constants.js';
 
 export interface TransferDeps {
@@ -11,7 +17,6 @@ export interface TransferDeps {
   log(line: string): void;
   permissions?: PermissionSession;
 }
-
 
 export interface RemotePermissionsOpts {
   /**
@@ -25,18 +30,29 @@ export interface RemotePermissionsOpts {
 }
 
 export async function withRemotePermissions(
-  deps: TransferDeps, conn: HostConnection, dir: string, fn: () => Promise<void>
+  deps: TransferDeps,
+  conn: HostConnection,
+  dir: string,
+  fn: () => Promise<void>
 ): Promise<void>;
 export async function withRemotePermissions(
-  deps: TransferDeps, conn: HostConnection, dir: string, opts: RemotePermissionsOpts, fn: () => Promise<void>
+  deps: TransferDeps,
+  conn: HostConnection,
+  dir: string,
+  opts: RemotePermissionsOpts,
+  fn: () => Promise<void>
 ): Promise<void>;
 export async function withRemotePermissions(
-  deps: TransferDeps, conn: HostConnection, dir: string,
-  optsOrFn: RemotePermissionsOpts | (() => Promise<void>), maybeFn?: () => Promise<void>
+  deps: TransferDeps,
+  conn: HostConnection,
+  dir: string,
+  optsOrFn: RemotePermissionsOpts | (() => Promise<void>),
+  maybeFn?: () => Promise<void>
 ): Promise<void> {
-  const { opts, fn } = typeof optsOrFn === 'function'
-    ? { opts: {} as RemotePermissionsOpts, fn: optsOrFn }
-    : { opts: optsOrFn, fn: maybeFn! };
+  const { opts, fn } =
+    typeof optsOrFn === 'function'
+      ? { opts: {} as RemotePermissionsOpts, fn: optsOrFn }
+      : { opts: optsOrFn, fn: maybeFn! };
   const recursive = opts.recursive ?? true;
   const flag = recursive ? '-R ' : '';
 
@@ -47,15 +63,41 @@ export async function withRemotePermissions(
     ? safeRestoreScript(dir, false)
     : `status=0; sudo chown www-data:www-data ${dir} || status=1; sudo chmod g-w ${dir} || status=1; exit "$status"`;
   await (deps.permissions ?? sshPermissionSession)(conn, open, restore, fn);
-
 }
 
 const INSTALL_STAMP_FILE = '.deploy-install-stamp';
 
-export async function syncAppDir(deps: TransferDeps, conn: HostConnection, cfg: WebDeployConfig): Promise<void> {
+export async function syncAppDir(
+  deps: TransferDeps,
+  conn: HostConnection,
+  cfg: WebDeployConfig
+): Promise<void> {
   const app = cfg.app;
   if (!app) return;
-  await execOrThrow(deps.exec, conn, `mkdir -p ${app.remotePath}`, 'mkdir app dir');
+  // Anchor the reviewed destination to the SSH cwd for relative paths, then
+  // open every component without following links. Existing roots/ancestors
+  // cannot redirect rsync --delete outside the intended deployment tree.
+  const prepareDirectory = `import os,sys
+value=sys.argv[1]
+assert value and all(part not in ('','.','..') for part in value.strip('/').split('/'))
+parts=os.path.abspath(value).strip('/').split('/')
+fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY)
+try:
+ for part in parts:
+  try: child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd)
+  except FileNotFoundError:
+   os.mkdir(part,0o755,dir_fd=fd)
+   child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd)
+  os.close(fd)
+  fd=child
+finally: os.close(fd)
+`;
+  await execOrThrow(
+    deps.exec,
+    conn,
+    `python3 -c ${shellQuote(prepareDirectory)} ${shellQuote(app.remotePath)}`,
+    'prepare safe app directory'
+  );
 
   deps.log(`[${conn.host}] Syncing app dir ${app.localPath} -> ${app.remotePath}...`);
   // .env, app.files, and the install stamp are all state that lives ONLY on
@@ -71,16 +113,18 @@ export async function syncAppDir(deps: TransferDeps, conn: HostConnection, cfg: 
     ...(app.exclude ?? []),
     '/.env',
     '/' + INSTALL_STAMP_FILE,
-    ...Object.keys(app.files ?? {}).map(f => '/' + f),
+    ...Object.keys(app.files ?? {}).map((f) => '/' + f),
   ];
-  await deps.rsync(buildRsyncArgs({
-    src: `${app.localPath}/`,
-    dest: `${conn.user}@${conn.host}:${app.remotePath}/`,
-    transport: sshTransportString(conn),
-    checksum: true,
-    delete: true,
-    excludes,
-  }));
+  await deps.rsync(
+    buildRsyncArgs({
+      src: `${app.localPath}/`,
+      dest: `${conn.user}@${conn.host}:${app.remotePath}/`,
+      transport: sshTransportString(conn),
+      checksum: true,
+      delete: true,
+      excludes,
+    })
+  );
 }
 
 /**
@@ -90,7 +134,9 @@ export async function syncAppDir(deps: TransferDeps, conn: HostConnection, cfg: 
  * provably-unnecessary install.
  */
 export function shouldInstallRemote(
-  localHash: string, remoteStampHash: string | null, nodeModulesPresent: boolean
+  localHash: string,
+  remoteStampHash: string | null,
+  nodeModulesPresent: boolean
 ): boolean {
   return !(localHash === remoteStampHash && nodeModulesPresent);
 }
@@ -106,7 +152,11 @@ export function shouldInstallRemote(
  * while probing (hash/stamp/node_modules) is treated as "must install" —
  * the gate fails safe.
  */
-export async function installAppDeps(deps: TransferDeps, conn: HostConnection, cfg: WebDeployConfig): Promise<void> {
+export async function installAppDeps(
+  deps: TransferDeps,
+  conn: HostConnection,
+  cfg: WebDeployConfig
+): Promise<void> {
   const app = cfg.app;
   if (!app?.yarnVersion) return;
 
@@ -114,12 +164,15 @@ export async function installAppDeps(deps: TransferDeps, conn: HostConnection, c
 
   // One SSH round trip. pipefail prevents a missing manifest from producing a
   // valid hash of empty input and incorrectly authorizing an install skip.
-  const probe = await deps.exec(conn, `bash -c ${shellQuote(`set -euo pipefail
+  const probe = await deps.exec(
+    conn,
+    `bash -c ${shellQuote(`set -euo pipefail
 hash=$(sha256sum ${app.remotePath}/package.json ${app.remotePath}/yarn.lock | sha256sum | cut -d' ' -f1)
 printf '%s\\n' "$hash"
 cat ${stampPath} 2>/dev/null || true
 printf '\\n'
-test ! -d ${app.remotePath}/node_modules || printf 'present\\n'`)} `);
+test ! -d ${app.remotePath}/node_modules || printf 'present\\n'`)} `
+  );
   const lines = probe.stdout.trim().split(/\n/).filter(Boolean);
   const localHash = probe.code === 0 && /^[a-f0-9]{64}$/.test(lines[0] ?? '') ? lines[0]! : '';
   const remoteStampHash = lines[1] ?? null;
@@ -130,19 +183,18 @@ test ! -d ${app.remotePath}/node_modules || printf 'present\\n'`)} `);
     return;
   }
 
-  deps.log(`[${conn.host}] Pinning yarn@${app.yarnVersion} and installing immutably...`);
-  await execOrThrow(deps.exec, conn, `cd ${app.remotePath} && corepack use yarn@${app.yarnVersion}`, 'corepack use');
-  // The staged lockfile is part of the accepted web artifact. A mutable
-  // install can silently rewrite it on one site, leaving two deployments
-  // with the same visible build number but different dependency lineages.
-  // Yarn's immutable mode makes that drift a hard deploy failure.
+  if (!/^[0-9]+\.[0-9]+\.[0-9]+$/.test(app.yarnVersion)) throw new Error('Expected an exact Yarn version');
+  deps.log(`[${conn.host}] Installing immutably with yarn@${app.yarnVersion}...`);
+  // `corepack use` rewrites package.json and also performs a mutable install.
+  // The explicit version proxy with auto-pin disabled preserves certified bytes.
   await execOrThrow(
     deps.exec,
     conn,
-    `cd ${app.remotePath} && yarn install --immutable`,
+    `cd ${app.remotePath} && COREPACK_ENABLE_AUTO_PIN=0 COREPACK_DEFAULT_TO_LATEST=0 corepack yarn@${app.yarnVersion} install --immutable`,
     'yarn install --immutable'
   );
-  if (localHash) await execOrThrow(deps.exec, conn, `printf %s "${localHash}" > ${stampPath}`, 'write install stamp');
+  if (localHash)
+    await execOrThrow(deps.exec, conn, `printf %s "${localHash}" > ${stampPath}`, 'write install stamp');
 }
 
 const shellQuote = (value: string): string => `'${value.replace(/'/g, `'"'"'`)}'`;
@@ -164,12 +216,16 @@ restore_entry() {
   if [ -n "$links" ]; then status=1; fi
   sudo find -P "$entry" -type l -prune -o -exec chown -h www-data:www-data {} + -exec chmod g-w {} + || status=1
 }
-${shared ? `shopt -s nullglob dotglob
+${
+  shared
+    ? `shopt -s nullglob dotglob
 for entry in "$root"/*; do
   name=\${entry##*/}
   if [[ "$name" =~ ^[0-9]+$ ]] && [ -d "$entry" ] && [ ! -L "$entry" ]; then continue; fi
   restore_entry "$entry"
-done` : `restore_entry "$root"`}
+done`
+    : `restore_entry "$root"`
+}
 exit "$status"`;
 }
 
@@ -202,20 +258,34 @@ for entry in "\${entries[@]}"; do
 done`;
 }
 
-async function withSharedPermissions(deps: TransferDeps, conn: HostConnection, dir: string, fn: () => Promise<void>): Promise<void> {
-  await (deps.permissions ?? sshPermissionSession)(conn,
+async function withSharedPermissions(
+  deps: TransferDeps,
+  conn: HostConnection,
+  dir: string,
+  fn: () => Promise<void>
+): Promise<void> {
+  await (deps.permissions ?? sshPermissionSession)(
+    conn,
     `bash -c ${shellQuote(sharedPermissionsScript(dir, conn.user, false))}`,
     `bash -c ${shellQuote(sharedPermissionsScript(dir, conn.user, true))}`,
-    fn);
+    fn
+  );
 }
 
 export async function deployStatic(
-  deps: TransferDeps, conn: HostConnection, cfg: WebDeployConfig, buildNumber: string
+  deps: TransferDeps,
+  conn: HostConnection,
+  cfg: WebDeployConfig,
+  buildNumber: string
 ): Promise<void> {
   const st = cfg.static;
   if (!st) return;
   if (!/^[1-9][0-9]*$/.test(buildNumber)) throw new Error('Invalid numeric build number');
-  if (!/^\/(?:[A-Za-z0-9_.-]+\/)+$/.test(st.remotePath) || st.remotePath.split('/').some(p => p === '.' || p === '..')) throw new Error('Unsafe static remote path');
+  if (
+    !/^\/(?:[A-Za-z0-9_.-]+\/)+$/.test(st.remotePath) ||
+    st.remotePath.split('/').some((p) => p === '.' || p === '..')
+  )
+    throw new Error('Unsafe static remote path');
   if (!/^[A-Za-z0-9_-]+$/.test(conn.user)) throw new Error('Unsafe SSH user');
   const dest = `${conn.user}@${conn.host}:${st.remotePath}`;
   const transport = sshTransportString(conn);
@@ -227,31 +297,46 @@ export async function deployStatic(
   // first step is `sudo chown -R` on it, which fails with "No such file or
   // directory" on a fresh build (the dir is only created by the rsync INSIDE
   // the wrap). mkdir -p is idempotent, so this is a no-op on repeat deploys.
-  await execOrThrow(deps.exec, conn, `test "$(realpath ${st.remotePath})" = ${shellQuote(st.remotePath.replace(/\/$/, ''))} && test ! -L ${st.remotePath}${buildNumber} && sudo mkdir -p ${st.remotePath}${buildNumber}/ && links=$(find ${st.remotePath}${buildNumber}/ -type l -print -quit) && test -z "$links"`, 'mkdir build dir');
-  await withRemotePermissions(deps, conn, `${st.remotePath}${buildNumber}/`, { recursive: true }, async () => {
-    deps.log(`[${conn.host}] Phase A: versioned assets ${buildNumber}/ ...`);
-    await deps.rsync(buildRsyncArgs({
-      src: `${st.localPath}${buildNumber}/`,
-      dest: `${dest}${buildNumber}/`,
-      transport,
-    }));
-  });
+  await execOrThrow(
+    deps.exec,
+    conn,
+    `test "$(realpath ${st.remotePath})" = ${shellQuote(st.remotePath.replace(/\/$/, ''))} && test ! -L ${st.remotePath}${buildNumber} && sudo mkdir -p ${st.remotePath}${buildNumber}/ && links=$(find ${st.remotePath}${buildNumber}/ -type l -print -quit) && test -z "$links"`,
+    'mkdir build dir'
+  );
+  await withRemotePermissions(
+    deps,
+    conn,
+    `${st.remotePath}${buildNumber}/`,
+    { recursive: true },
+    async () => {
+      deps.log(`[${conn.host}] Phase A: versioned assets ${buildNumber}/ ...`);
+      await deps.rsync(
+        buildRsyncArgs({
+          src: `${st.localPath}${buildNumber}/`,
+          dest: `${dest}${buildNumber}/`,
+          transport,
+        })
+      );
+    }
+  );
 
   // Phase B preserves nested shared write/mtime rights while retained builds
   // stay untouched. Re-enumerate on restoration to include new shared entries.
   await withSharedPermissions(deps, conn, st.remotePath, async () => {
     deps.log(`[${conn.host}] Phase B: shared static files (atomic switchover)...`);
-    await deps.rsync(buildRsyncArgs({
-      src: `${st.localPath}`,
-      dest: `${dest}`,
-      transport,
-      checksum: true,
-      delete: true,
-      delayUpdates: true,
-      // A positive include for every non-numeric name plus an exclusion for
-      // all numeric names protects short and long historical build directories.
-      filters: ['+ /*[!0-9]*/', '- /[0-9]*/'],
-    }));
+    await deps.rsync(
+      buildRsyncArgs({
+        src: `${st.localPath}`,
+        dest: `${dest}`,
+        transport,
+        checksum: true,
+        delete: true,
+        delayUpdates: true,
+        // A positive include for every non-numeric name plus an exclusion for
+        // all numeric names protects short and long historical build directories.
+        filters: ['+ /*[!0-9]*/', '- /[0-9]*/'],
+      })
+    );
   });
 }
 
@@ -260,7 +345,11 @@ export async function deployStatic(
  * MUST run only after CDN purge + version verify (cached HTML may still
  * reference an old /NNNNN/ dir).
  */
-export async function cleanupOldBuilds(deps: TransferDeps, conn: HostConnection, cfg: WebDeployConfig): Promise<void> {
+export async function cleanupOldBuilds(
+  deps: TransferDeps,
+  conn: HostConnection,
+  cfg: WebDeployConfig
+): Promise<void> {
   const st = cfg.static;
   if (!st) return;
   const keep = st.retentionCount ?? DEFAULT_RETENTION_COUNT;
@@ -271,7 +360,8 @@ export async function cleanupOldBuilds(deps: TransferDeps, conn: HostConnection,
   await withRemotePermissions(deps, conn, st.remotePath, { recursive: false }, async () => {
     deps.log(`[${conn.host}] Cleaning old version dirs (keeping last ${keep})...`);
     await execOrThrow(
-      deps.exec, conn,
+      deps.exec,
+      conn,
       `bash -c ${shellQuote(`set -euo pipefail
 root=${shellQuote(st.remotePath.replace(/\/$/, ''))}
 test "$(realpath "$root")" = "$root"
@@ -290,12 +380,14 @@ done | sort -rn | tail -n +${keep + 1} | while IFS= read -r name; do sudo rm -rf
 export function validateStaticSource(localPath: string, build: string): void {
   if (!/^[1-9][0-9]*$/.test(build)) throw new Error('Invalid numeric build number');
   const root = resolve(localPath);
-  if (realpathSync(root) !== root || !lstatSync(root).isDirectory()) throw new Error('Static source must be a real directory without symlink ancestors');
+  if (realpathSync(root) !== root || !lstatSync(root).isDirectory())
+    throw new Error('Static source must be a real directory without symlink ancestors');
   const visit = (path: string): void => {
     const stat = lstatSync(path);
     if (stat.isSymbolicLink()) throw new Error('Static source contains a symlink');
-    if (stat.isDirectory()) { for (const name of readdirSync(path)) visit(join(path, name)); }
-    else if (!stat.isFile()) throw new Error('Static source contains a special file');
+    if (stat.isDirectory()) {
+      for (const name of readdirSync(path)) visit(join(path, name));
+    } else if (!stat.isFile()) throw new Error('Static source contains a special file');
   };
   if (!lstatSync(join(root, build)).isDirectory()) throw new Error('Missing selected static build directory');
   for (const name of readdirSync(root)) {
@@ -303,4 +395,81 @@ export function validateStaticSource(localPath: string, build: string): void {
     if (name !== build && /^[0-9]+$/.test(name) && stat.isDirectory()) continue;
     visit(join(root, name));
   }
+}
+
+/** Transfer selected/shared static bytes once over the network to a private
+ * directory outside the webroot. Verify before promotion, then copy locally on
+ * the host using the same permission transactions and historical-build filters. */
+export async function stageAndPromoteStatic(
+  deps: TransferDeps,
+  conn: HostConnection,
+  cfg: WebDeployConfig,
+  build: string,
+  verify: (staticRoot?: string) => Promise<void>
+): Promise<void> {
+  if (!cfg.static) throw new Error('Static publication configuration is required');
+  if (!/^[1-9][0-9]*$/.test(build)) throw new Error('Invalid numeric build number');
+  const output = await execOrThrow(
+    deps.exec,
+    conn,
+    `umask 077; stage=$(mktemp -d /tmp/zn-webdeploy-XXXXXXXXXX) && mkdir -m 755 "$stage/static" && realpath "$stage"`,
+    'create private static staging'
+  );
+  const staging = output.trim();
+  if (!/^\/(?:private\/)?tmp\/zn-webdeploy-[A-Za-z0-9]{10}$/.test(staging))
+    throw new Error('Invalid private staging identity');
+  const staticRoot = `${staging}/static/`;
+  let failed = false;
+  let cleanupError: unknown;
+  try {
+    await deps.rsync(
+      buildRsyncArgs({
+        src: cfg.static.localPath,
+        dest: `${conn.user}@${conn.host}:${staticRoot}`,
+        transport: sshTransportString(conn),
+        filters: [`+ /${build}/`, '+ /*[!0-9]*/', '- /[0-9]*/'],
+      })
+    );
+    await verify(staticRoot);
+    const localPromotion: TransferDeps = {
+      ...deps,
+      rsync: async (args) => {
+        const local = [...args];
+        const transport = local.indexOf('-e');
+        if (transport !== -1) local.splice(transport, 2);
+        const remotePrefix = `${conn.user}@${conn.host}:`;
+        if (!local.at(-1)?.startsWith(remotePrefix)) throw new Error('Invalid promotion destination');
+        local[local.length - 1] = local.at(-1)!.slice(remotePrefix.length);
+        await execOrThrow(
+          deps.exec,
+          conn,
+          `rsync ${local.map(shellQuote).join(' ')}`,
+          'promote verified static bytes'
+        );
+      },
+    };
+    await deployStatic(
+      localPromotion,
+      conn,
+      { ...cfg, static: { ...cfg.static, localPath: staticRoot } },
+      build
+    );
+    await verify();
+  } catch (error) {
+    failed = true;
+    throw error;
+  } finally {
+    try {
+      await execOrThrow(
+        deps.exec,
+        conn,
+        `sudo rm -rf -- ${shellQuote(staging)}`,
+        'remove private static staging'
+      );
+    } catch (error) {
+      cleanupError = error;
+      if (failed) deps.log(`[${conn.host}] WARNING: private static staging cleanup failed`);
+    }
+  }
+  if (cleanupError) throw cleanupError;
 }
