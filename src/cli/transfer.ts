@@ -1,15 +1,16 @@
+import { lstatSync, readdirSync, realpathSync } from 'node:fs';
+import { resolve, join } from 'node:path';
 // Path: src/cli/transfer.ts
-import type { Exec, HostConnection, WebDeployConfig } from './types.js';
+import type { Exec, HostConnection, WebDeployConfig, TransferStats } from './types.js';
 import { buildRsyncArgs, execOrThrow, sshTransportString } from './ssh-exec.js';
 import { DEFAULT_RETENTION_COUNT } from './constants.js';
 
 export interface TransferDeps {
   exec: Exec;
-  rsync(args: string[]): Promise<void>;
+  rsync(args: string[]): Promise<void | TransferStats>;
   log(line: string): void;
 }
 
-const VERSIONED_DIR_GLOB = '[0-9][0-9][0-9][0-9][0-9]*';
 
 export interface RemotePermissionsOpts {
   /**
@@ -39,10 +40,10 @@ export async function withRemotePermissions(
   const flag = recursive ? '-R ' : '';
 
   deps.log(`[${conn.host}] Opening group-write on ${dir}...`);
-  await execOrThrow(deps.exec, conn, `sudo chown ${flag}${conn.user}:www-data ${dir}`, 'chown (open)');
-  await execOrThrow(deps.exec, conn, `sudo chmod ${flag}g+w ${dir}`, 'chmod (open)');
   let fnError: unknown;
   try {
+    await execOrThrow(deps.exec, conn, `sudo chown ${flag}${conn.user}:www-data ${dir}`, 'chown (open)');
+    await execOrThrow(deps.exec, conn, `sudo chmod ${flag}g+w ${dir}`, 'chmod (open)');
     await fn();
   } catch (err) {
     fnError = err;
@@ -124,32 +125,20 @@ export async function installAppDeps(deps: TransferDeps, conn: HostConnection, c
 
   const stampPath = `${app.remotePath}/${INSTALL_STAMP_FILE}`;
 
-  let localHash: string;
-  const hashRes = await deps.exec(
-    conn,
-    `sha256sum ${app.remotePath}/package.json ${app.remotePath}/yarn.lock 2>/dev/null | sha256sum | cut -d" " -f1`
-  );
-  if (hashRes.code !== 0) {
-    // Fail safe: if we can't even compute the hash, force an install.
-    localHash = `unhashable-${Date.now()}-${Math.random()}`;
-  } else {
-    // `sha256sum | cut -d" " -f1` already isolates the hash, but split
-    // defensively on whitespace too — sha256sum's own line format is
-    // "<hash>  -", and this keeps the parse robust regardless of exactly
-    // how the remote shell rendered it.
-    localHash = hashRes.stdout.trim().split(/\s+/)[0] ?? '';
-  }
+  // One SSH round trip. pipefail prevents a missing manifest from producing a
+  // valid hash of empty input and incorrectly authorizing an install skip.
+  const probe = await deps.exec(conn, `bash -c ${shellQuote(`set -euo pipefail
+hash=$(sha256sum ${app.remotePath}/package.json ${app.remotePath}/yarn.lock | sha256sum | cut -d' ' -f1)
+printf '%s\\n' "$hash"
+cat ${stampPath} 2>/dev/null || true
+printf '\\n'
+test ! -d ${app.remotePath}/node_modules || printf 'present\\n'`)} `);
+  const lines = probe.stdout.trim().split(/\n/).filter(Boolean);
+  const localHash = probe.code === 0 && /^[a-f0-9]{64}$/.test(lines[0] ?? '') ? lines[0]! : '';
+  const remoteStampHash = lines[1] ?? null;
+  const nodeModulesPresent = lines[2] === 'present';
 
-  const stampRes = await deps.exec(conn, `cat ${stampPath} 2>/dev/null`);
-  const remoteStampHash = stampRes.code === 0 ? stampRes.stdout.trim() : null;
-
-  const presentRes = await deps.exec(
-    conn,
-    `test -d ${app.remotePath}/node_modules && echo present || echo absent`
-  );
-  const nodeModulesPresent = presentRes.code === 0 && presentRes.stdout.trim() === 'present';
-
-  if (!shouldInstallRemote(localHash, remoteStampHash, nodeModulesPresent)) {
+  if (localHash && !shouldInstallRemote(localHash, remoteStampHash, nodeModulesPresent)) {
     deps.log(`[${conn.host}] deps unchanged — skipping install (QW4)`);
     return;
   }
@@ -166,7 +155,52 @@ export async function installAppDeps(deps: TransferDeps, conn: HostConnection, c
     `cd ${app.remotePath} && yarn install --immutable`,
     'yarn install --immutable'
   );
-  await execOrThrow(deps.exec, conn, `printf %s "${localHash}" > ${stampPath}`, 'write install stamp');
+  if (localHash) await execOrThrow(deps.exec, conn, `printf %s "${localHash}" > ${stampPath}`, 'write install stamp');
+}
+
+const shellQuote = (value: string): string => `'${value.replace(/'/g, `'"'"'`)}'`;
+
+/** Enumerate only top-level shared entries. Numeric build directories are never
+ * descended into, including short historical build numbers. Reject links before
+ * any recursive ownership operation; rsync needs ownership for nested mtimes. */
+export function sharedPermissionsScript(dir: string, user: string, restore: boolean): string {
+  const owner = restore ? 'www-data:www-data' : `${user}:www-data`;
+  const mode = restore ? 'g-w' : 'g+w';
+  return `set -euo pipefail
+root=${shellQuote(dir.replace(/\/$/, ''))}
+test -d "$root" && test ! -L "$root"
+test "$(realpath "$root")" = "$root"
+shopt -s nullglob dotglob
+entries=()
+for entry in "$root"/*; do
+  name=\${entry##*/}
+  if [[ "$name" =~ ^[0-9]+$ ]] && [ -d "$entry" ] && [ ! -L "$entry" ]; then continue; fi
+  test ! -L "$entry"
+  links=$(find "$entry" -type l -print -quit)
+  test -z "$links"
+  entries+=("$entry")
+done
+sudo chown ${shellQuote(owner)} "$root"
+sudo chmod ${mode} "$root"
+for entry in "\${entries[@]}"; do
+  sudo chown -R ${shellQuote(owner)} "$entry"
+  sudo chmod -R ${mode} "$entry"
+done`;
+}
+
+async function withSharedPermissions(deps: TransferDeps, conn: HostConnection, dir: string, fn: () => Promise<void>): Promise<void> {
+  let failure: unknown;
+  try {
+    await execOrThrow(deps.exec, conn, `bash -c ${shellQuote(sharedPermissionsScript(dir, conn.user, false))}`, 'shared permissions (open)');
+    await fn();
+  } catch (error) { failure = error; }
+  try {
+    await execOrThrow(deps.exec, conn, `bash -c ${shellQuote(sharedPermissionsScript(dir, conn.user, true))}`, 'shared permissions (restore)');
+  } catch (error) {
+    if (failure === undefined) throw error;
+    deps.log(`[${conn.host}] WARNING: shared permission restore also failed`);
+  }
+  if (failure !== undefined) throw failure;
 }
 
 export async function deployStatic(
@@ -174,6 +208,9 @@ export async function deployStatic(
 ): Promise<void> {
   const st = cfg.static;
   if (!st) return;
+  if (!/^[1-9][0-9]*$/.test(buildNumber)) throw new Error('Invalid numeric build number');
+  if (!/^\/(?:[A-Za-z0-9_.-]+\/)+$/.test(st.remotePath) || st.remotePath.split('/').some(p => p === '.' || p === '..')) throw new Error('Unsafe static remote path');
+  if (!/^[A-Za-z0-9_-]+$/.test(conn.user)) throw new Error('Unsafe SSH user');
   const dest = `${conn.user}@${conn.host}:${st.remotePath}`;
   const transport = sshTransportString(conn);
 
@@ -184,7 +221,7 @@ export async function deployStatic(
   // first step is `sudo chown -R` on it, which fails with "No such file or
   // directory" on a fresh build (the dir is only created by the rsync INSIDE
   // the wrap). mkdir -p is idempotent, so this is a no-op on repeat deploys.
-  await execOrThrow(deps.exec, conn, `sudo mkdir -p ${st.remotePath}${buildNumber}/`, 'mkdir build dir');
+  await execOrThrow(deps.exec, conn, `test "$(realpath ${st.remotePath})" = ${shellQuote(st.remotePath.replace(/\/$/, ''))} && test ! -L ${st.remotePath}${buildNumber} && sudo mkdir -p ${st.remotePath}${buildNumber}/ && links=$(find ${st.remotePath}${buildNumber}/ -type l -print -quit) && test -z "$links"`, 'mkdir build dir');
   await withRemotePermissions(deps, conn, `${st.remotePath}${buildNumber}/`, { recursive: true }, async () => {
     deps.log(`[${conn.host}] Phase A: versioned assets ${buildNumber}/ ...`);
     await deps.rsync(buildRsyncArgs({
@@ -194,19 +231,9 @@ export async function deployStatic(
     }));
   });
 
-  // Phase B: shared files + HTML, atomically staged (--delay-updates) so a
-  // request mid-transfer never sees a truncated file. MUST be recursive:
-  // rsync -a (checksum mode) preserves mtimes, and it recurses into
-  // pre-existing shared subdirectories (e.g. tinymce/plugins/*) that are
-  // owned by www-data, not the deploy user. Non-recursive g+w on the
-  // webroot only grants write on the top-level dir itself — it does not
-  // grant utimensat() rights on nested dirs/files the deploy user doesn't
-  // own, so rsync fails with "failed to set times on ... Operation not
-  // permitted" (exit 23) the moment it walks into one of those dirs.
-  // Recursive chown makes the deploy user the owner all the way down, same
-  // as the pre-QW3 behavior, so mtime preservation on unchanged nested
-  // shared dirs succeeds again.
-  await withRemotePermissions(deps, conn, st.remotePath, { recursive: true }, async () => {
+  // Phase B preserves nested shared write/mtime rights while retained builds
+  // stay untouched. Re-enumerate on restoration to include new shared entries.
+  await withSharedPermissions(deps, conn, st.remotePath, async () => {
     deps.log(`[${conn.host}] Phase B: shared static files (atomic switchover)...`);
     await deps.rsync(buildRsyncArgs({
       src: `${st.localPath}`,
@@ -215,7 +242,9 @@ export async function deployStatic(
       checksum: true,
       delete: true,
       delayUpdates: true,
-      filters: [`- /${VERSIONED_DIR_GLOB}/`],
+      // A positive include for every non-numeric name plus an exclusion for
+      // all numeric names protects short and long historical build directories.
+      filters: ['+ /*[!0-9]*/', '- /[0-9]*/'],
     }));
   });
 }
@@ -229,6 +258,7 @@ export async function cleanupOldBuilds(deps: TransferDeps, conn: HostConnection,
   const st = cfg.static;
   if (!st) return;
   const keep = st.retentionCount ?? DEFAULT_RETENTION_COUNT;
+  if (!Number.isInteger(keep) || keep < 1) throw new Error('retentionCount must be a positive integer');
   // Non-recursive: the rm -rf inside targets specific build dirs explicitly;
   // the wrap only needs the webroot's own top-level permissions opened, not
   // a recursive walk over every retained build dir.
@@ -236,8 +266,35 @@ export async function cleanupOldBuilds(deps: TransferDeps, conn: HostConnection,
     deps.log(`[${conn.host}] Cleaning old version dirs (keeping last ${keep})...`);
     await execOrThrow(
       deps.exec, conn,
-      `cd ${st.remotePath} && ls -d ${VERSIONED_DIR_GLOB}/ 2>/dev/null | sed 's|/||' | sort -rn | tail -n +${keep + 1} | xargs -r -I{} sudo rm -rf ${st.remotePath}{}`,
+      `bash -c ${shellQuote(`set -euo pipefail
+root=${shellQuote(st.remotePath.replace(/\/$/, ''))}
+test "$(realpath "$root")" = "$root"
+shopt -s nullglob
+for entry in "$root"/*; do
+  name=\${entry##*/}
+  if [[ "$name" =~ ^[0-9]+$ ]] && [ -d "$entry" ] && [ ! -L "$entry" ]; then printf '%s\\n' "$name"; fi
+done | sort -rn | tail -n +${keep + 1} | while IFS= read -r name; do sudo rm -rf -- "$root/$name"; done`)}`,
       'cleanup old builds'
     );
   });
+}
+
+/** Validate source before authentication/transfer. Reject links and special
+ * files, including ancestor symlinks; retained numeric trees are not sent. */
+export function validateStaticSource(localPath: string, build: string): void {
+  if (!/^[1-9][0-9]*$/.test(build)) throw new Error('Invalid numeric build number');
+  const root = resolve(localPath);
+  if (realpathSync(root) !== root || !lstatSync(root).isDirectory()) throw new Error('Static source must be a real directory without symlink ancestors');
+  const visit = (path: string): void => {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) throw new Error('Static source contains a symlink');
+    if (stat.isDirectory()) { for (const name of readdirSync(path)) visit(join(path, name)); }
+    else if (!stat.isFile()) throw new Error('Static source contains a special file');
+  };
+  if (!lstatSync(join(root, build)).isDirectory()) throw new Error('Missing selected static build directory');
+  for (const name of readdirSync(root)) {
+    const stat = lstatSync(join(root, name));
+    if (name !== build && /^[0-9]+$/.test(name) && stat.isDirectory()) continue;
+    visit(join(root, name));
+  }
 }

@@ -63,13 +63,21 @@ export interface HostConnection {
   user: string;
   keyPath: string;
   certPath: string;
+  /** Private socket owned by this invocation only. */
+  controlPath?: string;
+  certificateExpiresAt?: number;
 }
 
 export interface ExecResult { code: number; stdout: string; stderr: string }
 export type Exec = (conn: HostConnection, command: string) => Promise<ExecResult>;
 export type ExecPipe = (conn: HostConnection, command: string, stdin: string) => Promise<ExecResult>;
 
+export interface TransferStats { transferredBytes?: number }
+export interface PhaseTiming extends TransferStats { phase: string; host?: string; durationMs: number; success: boolean }
+
 export interface HostDeployResult {
+  durationMs?: number;
+  transferredBytes?: number;
   host: string;
   success: boolean;
   skipped?: boolean;
@@ -79,6 +87,7 @@ export interface HostDeployResult {
 }
 
 export interface RunSummary {
+  timings?: PhaseTiming[];
   config: string;
   build: string;
   hosts: HostDeployResult[];

@@ -308,3 +308,25 @@ describe('renderEnvFile', () => {
     expect(renderEnvFile({ A: '1', B: 'two' })).toBe('A=1\nB=two\n');
   });
 });
+
+it('includes successful and failed host phase timings and rsync bytes without losing rolling failure gates', async () => {
+  const {deps} = makeDeps();
+  let transfers=0;
+  deps.rsync=async()=>{ transfers++; if(transfers===4) throw new Error('transfer failed'); return {transferredBytes:1234}; };
+  const summary=await runDeploy('prod',cfg,conns,deps);
+  expect(summary.success).toBe(false);
+  expect(summary.timings?.some(t=>t.phase==='rsync' && t.host==='192.0.2.1' && t.transferredBytes===1234 && t.success)).toBe(true);
+  expect(summary.timings?.some(t=>t.phase==='rsync' && t.host==='192.0.2.2' && !t.success)).toBe(true);
+  expect(summary.hosts[0]?.transferredBytes).toBe(3702);
+  expect(summary.hosts.every(h=>typeof h.durationMs==='number')).toBe(true);
+  expect(summary.timings?.every(t=>t.durationMs>=0)).toBe(true);
+});
+it('retains failure timing evidence when a pre-mutation nginx baseline check throws',async()=>{
+  const {deps}=makeDeps();
+  const content='upstream myzn { server 127.0.0.1:3000; }';
+  deps.readNginxFile=()=>content;
+  deps.exec=async()=>({code:1,stdout:'',stderr:'unavailable'});
+  const managedCfg={...cfg,nginx:{config:{localPath:'unused',remotePath:'/etc/nginx/sites-available/default',enabledPath:'/etc/nginx/sites-enabled/default',upstream:'myzn'}}};
+  try {await runDeploy('prod',managedCfg,conns,deps);throw new Error('must reject');}
+  catch(error){expect((error as {timings?:unknown[]}).timings).toEqual([expect.objectContaining({phase:'nginx-baseline',host:'192.0.2.1',success:false})]);}
+});

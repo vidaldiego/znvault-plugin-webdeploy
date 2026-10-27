@@ -1,5 +1,5 @@
 // Path: src/cli/run.ts
-import type { Exec, ExecPipe, HostConnection, HostDeployResult, RunSummary, WebDeployConfig } from './types.js';
+import type { Exec, ExecPipe, HostConnection, HostDeployResult, RunSummary, WebDeployConfig, TransferStats } from './types.js';
 import { syncAppDir, installAppDeps, deployStatic, cleanupOldBuilds, type TransferDeps } from './transfer.js';
 import { writeRemoteFileIfChanged } from './remote-files.js';
 import { reloadOrStartPm2, reloadNginx } from './pm2.js';
@@ -8,13 +8,14 @@ import { purgeCloudflare, verifyVersions } from './cdn-cloudflare.js';
 import { sendWebhook, syncHelp } from './notify.js';
 import { VERSION_VERIFY_CEILING_MS } from './constants.js';
 import { probeVersion } from './http-probe.js';
+import { Timings } from './timing.js';
 import { readFileSync } from 'node:fs';
 import { applyNginx, assertNginxBaseline, checkNginxListeners, digest, readNginxHash, rollbackNginx, type NginxChange } from './nginx.js';
 
 export interface RunDeps {
   exec: Exec;
   pipe: ExecPipe;
-  rsync(args: string[]): Promise<void>;
+  rsync(args: string[]): Promise<void | TransferStats>;
   fetchImpl: typeof fetch;
   log(line: string): void;
   readVersionFile(path: string): string;
@@ -43,11 +44,12 @@ export function renderEnvFile(env: Record<string, string>): string {
   return Object.entries(env).map(([k, v]) => `${k}=${v}`).join('\n') + '\n';
 }
 
-async function deployHost(cfg: WebDeployConfig, conn: HostConnection, build: string, deps: RunDeps, nginxContent?: string): Promise<NginxChange | undefined> {
-  const tdeps: TransferDeps = { exec: deps.exec, rsync: deps.rsync, log: deps.log };
+async function deployHost(cfg: WebDeployConfig, conn: HostConnection, build: string, deps: RunDeps, timing: Timings, nginxContent?: string): Promise<NginxChange | undefined> {
+  const measure = <T>(phase: string, fn: () => Promise<T>) => timing.measure(phase, conn.host, fn);
+  const tdeps: TransferDeps = { exec: deps.exec, rsync: args => measure('rsync', () => deps.rsync(args)), log: deps.log };
 
   if (cfg.app) {
-    await syncAppDir(tdeps, conn, cfg);
+    await measure('app-sync', () => syncAppDir(tdeps, conn, cfg));
     // Rendered files must exist BEFORE yarn install: .yarnrc.yml carries the
     // registry tokens the install needs (rsync just shipped a token-less tree).
     if (cfg.app.env) {
@@ -56,17 +58,17 @@ async function deployHost(cfg: WebDeployConfig, conn: HostConnection, build: str
     for (const [file, content] of Object.entries(cfg.app.files ?? {})) {
       await writeRemoteFileIfChanged(deps.exec, deps.pipe, conn, `${cfg.app.remotePath}/${file}`, content);
     }
-    await installAppDeps(tdeps, conn, cfg);
+    await measure('dependencies', () => installAppDeps(tdeps, conn, cfg));
   }
 
-  await deployStatic(tdeps, conn, cfg, build);
+  await measure('static', () => deployStatic(tdeps, conn, cfg, build));
 
   if (cfg.app) {
-    await reloadOrStartPm2(deps.exec, conn, { remotePath: cfg.app.remotePath, app: cfg.app.pm2App, log: deps.log, settleMs: deps.pm2SettleMs });
+    await measure('pm2', () => reloadOrStartPm2(deps.exec, conn, { remotePath: cfg.app!.remotePath, app: cfg.app!.pm2App, log: deps.log, settleMs: deps.pm2SettleMs }));
   }
   if (cfg.nginx?.config && nginxContent !== undefined) {
     await checkNginxListeners(deps.exec, conn, nginxContent, cfg.nginx.config);
-    const change = await applyNginx(deps.exec, deps.pipe, conn, cfg.nginx.config, nginxContent);
+    const change = await measure('nginx', () => applyNginx(deps.exec, deps.pipe, conn, cfg.nginx!.config!, nginxContent));
     try {
       // applyNginx already validated/reloaded a changed config. The unchanged
       // case still reloads after the application/static rollout.
@@ -95,6 +97,7 @@ export async function runDeploy(
   conns: HostConnection[],
   deps: RunDeps
 ): Promise<RunSummary> {
+  const timing = new Timings();
   const build = deps.readVersionFile(cfg.versionFile).trim();
   const warnings: string[] = [];
   const hosts: HostDeployResult[] = [];
@@ -106,7 +109,7 @@ export async function runDeploy(
   const nginxContent = managed ? (deps.readNginxFile ?? (p => readFileSync(p, 'utf8')))(managed.localPath) : undefined;
   if (managed && nginxContent !== undefined) {
     for (const conn of conns) {
-      assertNginxBaseline(await readNginxHash(deps.exec, conn, managed), nginxContent, managed);
+      await timing.measure('nginx-baseline', conn.host, async () => { assertNginxBaseline(await readNginxHash(deps.exec, conn, managed), nginxContent, managed); });
     }
   }
 
@@ -118,22 +121,23 @@ export async function runDeploy(
       continue;
     }
 
+    const hostStart = performance.now();
     let nginxChange: NginxChange | undefined;
     try {
       deps.log(`=== Deploying ${conn.host} (${i + 1}/${conns.length}) ===`);
       mutationAttempted = true;
-      nginxChange = await deployHost(cfg, conn, build, deps, nginxContent);
+      nginxChange = await timing.measure('host-deploy', conn.host, () => deployHost(cfg, conn, build, deps, timing, nginxContent));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       deps.log(`[${conn.host}] ❌ Deploy failed: ${message}`);
-      hosts.push({ host: conn.host, success: false, error: message, healthResults: [], healthOk: false });
+      hosts.push({ host: conn.host, success: false, error: message, healthResults: [], healthOk: false, durationMs: performance.now() - hostStart });
       abort = true;
       continue;
     }
 
     // Health gate (also run on the last host, for the summary)
-    const health = await runHealthChecks(deps.exec, conn, cfg.healthChecks ?? []).catch(() => ({ success: false, results: ['❌ Health probe failed'] }));
-    hosts.push({ host: conn.host, success: true, healthResults: health.results, healthOk: health.success });
+    const health = await timing.measure('health', conn.host, () => runHealthChecks(deps.exec, conn, cfg.healthChecks ?? []).catch(() => ({ success: false, results: ['❌ Health probe failed'] })));
+    hosts.push({ host: conn.host, success: true, healthResults: health.results, healthOk: health.success, durationMs: performance.now() - hostStart });
     if (!health.success) {
       if (nginxChange && managed) {
         try {
@@ -150,6 +154,7 @@ export async function runDeploy(
   }
 
   const summary: RunSummary = {
+    timings: timing.entries,
     config: configName,
     build,
     hosts,
@@ -157,23 +162,27 @@ export async function runDeploy(
     success: false,
   };
 
+  for (const host of hosts) {
+    const measured = timing.entries.filter(t => t.host === host.host && t.phase === 'rsync' && t.transferredBytes !== undefined);
+    if (measured.length) host.transferredBytes = measured.reduce((total, t) => total + t.transferredBytes!, 0);
+  }
   const anyDeployed = hosts.some(h => h.success);
   if (anyDeployed) {
     if (cfg.cdn) {
-      summary.purge = await purgeCloudflare(deps.fetchImpl, cfg.cdn);
+      summary.purge = await timing.measure('cdn-purge', undefined, () => purgeCloudflare(deps.fetchImpl, cfg.cdn!));
       if (!summary.purge.ok) warnings.push(`CDN purge failed: ${summary.purge.detail ?? ''}`);
     }
     if (cfg.verify) {
-      summary.verify = await verifyVersions(
+      summary.verify = await timing.measure('version', undefined, () => verifyVersions(
         deps.probeVersion ?? probeVersion,
         hosts.filter(h => h.success).map(h => h.host),
         {
           expected: build,
-          versionPath: cfg.verify.versionPath,
-          hostHeader: cfg.verify.hostHeader,
+          versionPath: cfg.verify!.versionPath,
+          hostHeader: cfg.verify!.hostHeader,
           retryCeilingMs: deps.versionVerifyCeilingMs ?? VERSION_VERIFY_CEILING_MS,
         }
-      );
+      ));
       if (summary.verify && !summary.verify.allMatch) warnings.push('version verification mismatch on at least one host');
     }
   }
@@ -191,7 +200,7 @@ export async function runDeploy(
     for (const h of hosts) {
       const conn = conns.find(c => c.host === h.host)!;
       try {
-        await cleanupOldBuilds(tdeps, conn, cfg);
+        await timing.measure('cleanup', conn.host, () => cleanupOldBuilds(tdeps, conn, cfg));
       } catch (err) {
         warnings.push(`cleanup failed on ${h.host}: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -200,8 +209,8 @@ export async function runDeploy(
     warnings.push('deployment changed at least one host but did not pass every gate; old builds were retained for recovery');
   }
 
-  if (cfg.notify?.helpSync) await syncHelp(deps.fetchImpl, cfg.notify.helpSync, deps.log);
-  if (cfg.notify?.webhook) await sendWebhook(deps.fetchImpl, cfg.notify.webhook, summary, deps.redact);
+  if (cfg.notify?.helpSync) await timing.measure('help', undefined, () => syncHelp(deps.fetchImpl, cfg.notify!.helpSync!, deps.log));
+  if (cfg.notify?.webhook) await timing.measure('webhook', undefined, () => sendWebhook(deps.fetchImpl, cfg.notify!.webhook!, summary, deps.redact));
 
   return summary;
 }

@@ -11,7 +11,7 @@ interface ParsedLine { status: Status; detail: string }
  * Detail must not contain '|' or newlines — each fragment guards for that
  * where the underlying value could plausibly contain one.
  */
-function checkFragment(idx: number, spec: HealthCheckSpec): string {
+function checkFragment(idx: number, spec: HealthCheckSpec, readOnly = false): string {
   switch (spec.type) {
     case 'systemd':
       return [
@@ -30,6 +30,7 @@ function checkFragment(idx: number, spec: HealthCheckSpec): string {
     }
 
     case 'pm2':
+      if (readOnly) return readOnlyPm2Fragment(idx);
       // Detail carries app|online|total so parseHealthOutput can rebuild the
       // exact "N/M instances online" / "not found" / "failed to parse" text
       // without re-deriving it in shell.
@@ -82,8 +83,8 @@ function checkFragment(idx: number, spec: HealthCheckSpec): string {
 }
 
 /** Composes one shell script that runs every check and emits one `idx|STATUS|detail` line per check. */
-export function buildHealthScript(specs: HealthCheckSpec[]): string {
-  return specs.map((spec, idx) => `(${checkFragment(idx, spec)})`).join('\n');
+export function buildHealthScript(specs: HealthCheckSpec[], opts: {readOnly?: boolean} = {}): string {
+  return specs.map((spec, idx) => `(${checkFragment(idx, spec, opts.readOnly)})`).join('\n');
 }
 
 function parsePm2Detail(jlist: string, app: string): { status: Status; line: string } {
@@ -182,10 +183,32 @@ export function parseHealthOutput(specs: HealthCheckSpec[], stdout: string): { s
 export async function runHealthChecks(
   exec: Exec,
   conn: HostConnection,
-  specs: HealthCheckSpec[]
+  specs: HealthCheckSpec[],
+  opts: {readOnly?: boolean} = {}
 ): Promise<{ success: boolean; results: string[] }> {
   if (specs.length === 0) return { success: true, results: [] };
-  const res = await exec(conn, buildHealthScript(specs));
+  const res = await exec(conn, buildHealthScript(specs, opts));
   if (res.code !== 0) return { success: false, results: ['❌ Health transport/script failed'] };
   return parseHealthOutput(specs, res.stdout);
+}
+
+/** PM2's CLI can start a daemon even for jlist. Connect directly to its
+ * existing read RPC without loading PM2's API/Client (both initialize files).
+ * Unsupported package layouts or an absent socket fail closed. Only status
+ * fields cross the transport; PM2 environment variables remain on the host. */
+function readOnlyPm2Fragment(index: number): string {
+  const program = `
+const fs=require('node:fs'),path=require('node:path'),os=require('node:os');
+const root=path.dirname(path.dirname(fs.realpathSync(process.argv[1])));
+const load=name=>{try{return require(path.join(root,'modules',name))}catch(e){if(e.code!=='MODULE_NOT_FOUND')throw e;return require(require.resolve(name,{paths:[root]}))}};
+const axon=load('pm2-axon'),rpc=load('pm2-axon-rpc');
+const sock=axon.socket('req'),client=new rpc.Client(sock);
+const finish=(err,apps)=>{if(err){sock.close();process.exit(1)};process.stdout.write(JSON.stringify(apps.map(a=>({name:a.name,pm2_env:{status:a.pm2_env&&a.pm2_env.status}}))));sock.close();process.exit(0)};
+setTimeout(()=>finish(new Error('timeout')),3000);
+sock.once('error',finish);
+sock.once('connect',()=>client.call('getMonitorData',{},finish));
+sock.connect(path.join(process.env.PM2_HOME||path.join(os.homedir(),'.pm2'),'rpc.sock'));
+`;
+  const quoted = `'${program.replace(/'/g, `'"'"'`)}'`;
+  return `JLIST=$(node -e ${quoted} "$(command -v pm2)" 2>/dev/null); printf '%s|PM2|%s\\n' ${index} "$JLIST"`;
 }

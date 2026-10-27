@@ -41,9 +41,12 @@ function identityChecks(spec: ManagedNginx): string {
     `test "$(readlink -f ${quote(spec.enabledPath)})" = ${quote(spec.remotePath)}`;
 }
 
-export async function readNginxHash(exec: Exec, conn: HostConnection, spec: ManagedNginx): Promise<string> {
+export async function readNginxHash(exec: Exec, conn: HostConnection, spec: ManagedNginx, opts: { readOnly?: boolean } = {}): Promise<string> {
   validateManagedNginx(spec);
-  const result = await exec(conn, `set -e\n${identityChecks(spec)}\nsudo -n nginx -t >/dev/null 2>&1\nsudo -n nginx -T 2>/dev/null | grep -Fx ${quote(`# configuration file ${spec.enabledPath}:`)} >/dev/null\nsha256sum ${quote(spec.remotePath)}`);
+  // nginx -t/-T can create configured log files. Read-only verification checks
+  // enabled-link identity and reviewed bytes, then independent health/listeners.
+  const syntax = opts.readOnly ? '' : `sudo -n nginx -t >/dev/null 2>&1\nsudo -n nginx -T 2>/dev/null | grep -Fx ${quote(`# configuration file ${spec.enabledPath}:`)} >/dev/null\n`;
+  const result = await exec(conn, `set -e\n${identityChecks(spec)}\n${syntax}sha256sum ${quote(spec.remotePath)}`);
   const hash = result.stdout.trim().split(/\s/)[0] ?? '';
   if (result.code !== 0 || !/^[a-f0-9]{64}$/.test(hash)) throw new Error(`[${conn.host}] nginx identity/syntax/readback failed`);
   return hash;

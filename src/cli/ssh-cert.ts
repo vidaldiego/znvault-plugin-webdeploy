@@ -1,6 +1,6 @@
 // Path: src/cli/ssh-cert.ts
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { CLIPluginContext } from './plugin-types.js';
@@ -21,14 +21,15 @@ const realIO: CertIO = {
   exists: existsSync,
   read: p => readFileSync(p, 'utf-8'),
   write: (p, c) => writeFileSync(p, c, { mode: 0o600 }),
-  sshKeygenL: p => execSync(`ssh-keygen -L -f "${p}"`, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }),
+  sshKeygenL: p => execFileSync('ssh-keygen', ['-L', '-f', p], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }),
 };
 
-export interface CertInfo { principals: string[]; validBefore: Date | null }
+export interface CertInfo { principals: string[]; validBefore: Date | null; validAfter?: Date | null }
 
 export function parseCertInfo(output: string): CertInfo {
-  const validMatch = output.match(/Valid:\s+from\s+\S+\s+to\s+(\S+)/);
-  const validBefore = validMatch?.[1] ? new Date(validMatch[1]) : null;
+  const validMatch = output.match(/Valid:\s+from\s+(\S+)\s+to\s+(\S+)/);
+  const validAfter = validMatch?.[1] ? new Date(validMatch[1]) : null;
+  const validBefore = validMatch?.[2] ? new Date(validMatch[2]) : null;
 
   const principals: string[] = [];
   const lines = output.split('\n');
@@ -40,11 +41,12 @@ export function parseCertInfo(output: string): CertInfo {
       else break;
     }
   }
-  return { principals, validBefore };
+  return { principals, validBefore, validAfter };
 }
 
 export function certIsUsable(info: CertInfo, principal: string, now: Date): { ok: boolean; reason?: string } {
-  if (!info.validBefore) return { ok: false, reason: 'could not parse validity' };
+  if (!info.validBefore || !Number.isFinite(info.validBefore.getTime())) return { ok: false, reason: 'could not parse validity' };
+  if (info.validAfter && (!Number.isFinite(info.validAfter.getTime()) || info.validAfter.getTime() > now.getTime())) return {ok:false, reason:'not yet valid'};
   if (info.validBefore.getTime() - now.getTime() < EXPIRY_BUFFER_MS) return { ok: false, reason: 'expired or expiring soon' };
   if (!info.principals.includes(principal)) return { ok: false, reason: `missing principal '${principal}' (has: ${info.principals.join(', ') || 'none'})` };
   return { ok: true };
@@ -61,7 +63,7 @@ function findDefaultKey(io: CertIO): string {
 export async function ensureCertificate(
   client: VaultClient,
   opts: { principal: string; ttlSeconds: number; keyPath?: string; io?: CertIO }
-): Promise<{ keyPath: string; certPath: string }> {
+): Promise<{ keyPath: string; certPath: string; certificateExpiresAt: number }> {
   const io = opts.io ?? realIO;
   const keyPath = opts.keyPath ?? findDefaultKey(io);
   const certPath = `${keyPath}-webdeploy-cert.pub`;
@@ -69,7 +71,7 @@ export async function ensureCertificate(
   if (io.exists(certPath)) {
     try {
       const info = parseCertInfo(io.sshKeygenL(certPath));
-      if (certIsUsable(info, opts.principal, new Date()).ok) return { keyPath, certPath };
+      if (certIsUsable(info, opts.principal, new Date()).ok) return { keyPath, certPath, certificateExpiresAt: info.validBefore!.getTime() };
     } catch {
       // fall through to re-sign
     }
@@ -82,5 +84,8 @@ export async function ensureCertificate(
     principals: [opts.principal],
   });
   io.write(certPath, result.certificate.trim() + '\n');
-  return { keyPath, certPath };
+  const info = parseCertInfo(io.sshKeygenL(certPath));
+  const validity = certIsUsable(info, opts.principal, new Date());
+  if (!validity.ok) throw new Error(`Signed SSH certificate is unusable: ${validity.reason}`);
+  return { keyPath, certPath, certificateExpiresAt: info.validBefore!.getTime() };
 }

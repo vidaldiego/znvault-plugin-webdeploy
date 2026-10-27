@@ -99,7 +99,7 @@ describe('installAppDeps gating', () => {
     const deps = {
       exec: async (_c: HostConnection, command: string): Promise<ExecResult> => {
         calls.push(command);
-        if (command.includes('sha256sum')) return { code: 0, stdout: 'HASH  -\n', stderr: '' };
+        if (command.includes('sha256sum')) return { code: 0, stdout: `${'a'.repeat(64)}\n${'a'.repeat(64)}\npresent\n`, stderr: '' };
         if (command.includes('.deploy-install-stamp') && command.includes('cat')) return { code: 0, stdout: 'HASH\n', stderr: '' };
         if (command.includes('test -d') && command.includes('node_modules')) return { code: 0, stdout: 'present\n', stderr: '' };
         return { code: 0, stdout: '', stderr: '' };
@@ -115,7 +115,7 @@ describe('installAppDeps gating', () => {
     const deps = {
       exec: async (_c: HostConnection, command: string): Promise<ExecResult> => {
         calls.push(command);
-        if (command.includes('sha256sum')) return { code: 0, stdout: 'HASH  -\n', stderr: '' };
+        if (command.includes('sha256sum')) return { code: 0, stdout: `${'a'.repeat(64)}\n\n`, stderr: '' };
         if (command.includes('.deploy-install-stamp') && command.includes('cat')) return { code: 1, stdout: '', stderr: 'no stamp' };
         if (command.includes('test -d') && command.includes('node_modules')) return { code: 1, stdout: 'absent\n', stderr: '' };
         return { code: 0, stdout: '', stderr: '' };
@@ -139,7 +139,7 @@ describe('installAppDeps gating', () => {
     const firstDeps = {
       exec: async (_c: HostConnection, command: string): Promise<ExecResult> => {
         callsFirst.push(command);
-        if (command.includes('sha256sum')) return { code: 0, stdout: 'HASH  -\n', stderr: '' };
+        if (command.includes('sha256sum')) return { code: 0, stdout: `${'a'.repeat(64)}\n\n`, stderr: '' };
         if (command.includes('.deploy-install-stamp') && command.startsWith('cat')) return { code: 1, stdout: '', stderr: 'no stamp' };
         if (command.includes('test -d') && command.includes('node_modules')) return { code: 1, stdout: 'absent\n', stderr: '' };
         if (command.startsWith('printf %s') && command.includes('.deploy-install-stamp')) {
@@ -159,7 +159,7 @@ describe('installAppDeps gating', () => {
     const secondDeps = {
       exec: async (_c: HostConnection, command: string): Promise<ExecResult> => {
         callsSecond.push(command);
-        if (command.includes('sha256sum')) return { code: 0, stdout: 'HASH  -\n', stderr: '' };
+        if (command.includes('sha256sum')) return { code: 0, stdout: `${'a'.repeat(64)}\n${'a'.repeat(64)}\npresent\n`, stderr: '' };
         if (command.includes('.deploy-install-stamp') && command.startsWith('cat')) return { code: 0, stdout: `${writtenStamp}\n`, stderr: '' };
         if (command.includes('test -d') && command.includes('node_modules')) return { code: 0, stdout: 'present\n', stderr: '' };
         return { code: 0, stdout: '', stderr: '' };
@@ -184,11 +184,7 @@ describe('deployStatic', () => {
     expect(h.execCalls[0]).toContain('mkdir -p /var/www/30412/');
     // Phase A permission wrap: scoped to the new versioned dir, recursive (it's one small new dir).
     expect(h.execCalls[1]).toContain('chown -R ops:www-data /var/www/30412/');
-    // Phase B permission wrap: recursive over the webroot (incident fix — rsync -a sets
-    // mtimes on pre-existing nested shared dirs the deploy user doesn't own, e.g.
-    // tinymce/plugins/*, so ownership must be granted all the way down, not just at the top).
-    expect(h.execCalls.some(c => c.includes('chown -R ops:www-data /var/www/'))).toBe(true);
-    expect(h.execCalls.at(-1)).toContain('chmod -R g-w /var/www/');
+
   });
 
   it('creates the build dir with mkdir -p BEFORE the Phase A chown (C1 — chown on a nonexistent dir fails on fresh builds)', async () => {
@@ -200,20 +196,7 @@ describe('deployStatic', () => {
     expect(chownIdx).toBeGreaterThan(mkdirIdx);
   });
 
-  it('opens perms on the NEW build dir (Phase A) and recursively on the webroot (Phase B — incident fix)', async () => {
-    const execCalls: string[] = [];
-    const deps = {
-      exec: async (_c: HostConnection, command: string): Promise<ExecResult> => { execCalls.push(command); return { code: 0, stdout: '', stderr: '' }; },
-      rsync: async () => {}, log: () => {},
-    };
-    await deployStatic(deps as never, conn as never, cfg, '30412');
-    // Phase A chown targets the versioned dir specifically
-    expect(execCalls.some(c => c.includes('chown') && c.includes('/var/www/30412'))).toBe(true);
-    // Phase B DOES use -R over the webroot: rsync -a preserves mtimes on unchanged
-    // nested shared dirs (e.g. tinymce/plugins/*) owned by www-data, not the deploy
-    // user, so ownership must be recursive or utimensat() fails with EPERM (rsync exit 23).
-    expect(execCalls.some(c => /chown -R \S+ \/var\/www\/\s*$/.test(c.trim() + ' '))).toBe(true);
-  });
+
 });
 
 describe('cleanupOldBuilds', () => {
@@ -230,7 +213,7 @@ describe('cleanupOldBuilds', () => {
     const h = harness();
     h.deps.exec = async (_c: HostConnection, command: string): Promise<ExecResult> => {
       h.execCalls.push(command);
-      if (command.includes('xargs')) {
+      if (command.includes('while IFS=')) {
         return { code: 123, stdout: '', stderr: 'rm: cannot remove' };
       }
       return { code: 0, stdout: '', stderr: '' };

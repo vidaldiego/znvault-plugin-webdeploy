@@ -55,11 +55,22 @@ describe('ensureCertificate', () => {
       exists: (p: string) => p in files,
       read: (p: string) => files[p] ?? '',
       write: (p: string, c: string) => { files[p] = c; },
-      sshKeygenL: () => { throw new Error('no cert yet'); },
+      sshKeygenL: () => KEYGEN_OUTPUT.replaceAll('2026-07-04', '2099-07-04').replace('from 2099-07-04T10:00:00', 'from 2020-07-04T10:00:00'),
     };
     const res = await ensureCertificate(client, { principal: 'deploy', ttlSeconds: 3600, keyPath: '/k/id_ed25519', io });
     expect(res.certPath).toBe('/k/id_ed25519-webdeploy-cert.pub');
     expect(files[res.certPath]).toContain('CERTDATA');
     expect(signedBody).toEqual({ publicKey: 'ssh-ed25519 AAAA test', ttlSeconds: 3600, principals: ['deploy'] });
   });
+});
+
+it('rejects malformed and not-yet-valid certificate timestamps', () => {
+  expect(certIsUsable({principals:['deploy'],validBefore:new Date('bad')},'deploy',new Date()).ok).toBe(false);
+  const future=parseCertInfo(KEYGEN_OUTPUT.replace('2026-07-04','2099-07-04').replace('2026-07-04','2099-07-04'));
+  expect(certIsUsable(future,'deploy',new Date('2026-07-04T12:00:00')).ok).toBe(false);
+});
+it('returns the existing certificate expiry without signing when validity is sufficient',async()=>{
+  const future=KEYGEN_OUTPUT.replaceAll('2026-07-04','2099-07-04').replace('from 2099-07-04T10:00:00','from 2020-07-04T10:00:00');
+  const result=await ensureCertificate({post:async()=>{throw new Error('must not sign');}} as never,{keyPath:'/k/key',principal:'deploy',ttlSeconds:3600,io:{exists:()=>true,read:()=>'',write:()=>{throw new Error('must not write');},sshKeygenL:()=>future}});
+  expect(result.certificateExpiresAt).toBe(new Date('2099-07-04T18:00:00').getTime());
 });

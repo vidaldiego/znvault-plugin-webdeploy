@@ -406,13 +406,9 @@ The lock is released on normal completion and on `SIGINT`/`SIGTERM`
 
 The plugin includes four non-breaking performance optimizations:
 
-- **QW3 (scoped permissions):** `chown`/`chmod` operations during static asset
-  deployment are now scoped to written paths only. Phase A (versioned build
-  directory) runs with `-R` recursively on the new dir; Phase B (webroot
-  shared files) runs without `-R`, touching only the top-level directory
-  itself. This avoids expensive recursive permission changes over dozens of
-  pre-existing build directories. Safe because rsync runs as an unprivileged
-  SSH user with `--delay-updates` (directory write suffices).
+- **QW3:** superseded by v0.4.0 below. Shared directories require recursive
+  ownership for rsync to preserve nested mtimes; top-level write permission
+  alone is insufficient.
 
 - **QW4 (install gate):** Dependency installation now skips `corepack use`
   and `yarn install --immutable` entirely when the remote manifest hash
@@ -438,6 +434,61 @@ The plugin includes four non-breaking performance optimizations:
 **None of these changes alter the security model** (SSH-CA certs, vault
 secrets, redaction, stdin-piped file writes) **or the result contract**
 (warnings vs. failures, exit codes, third-party integrations).
+
+## Release transport and verification (v0.4.0)
+
+```bash
+znvault webdeploy verify zn-web-prod --config-file release/webdeploy.production.json --expected-build 30542 --json
+```
+
+`verify` returns zero only when **every configured host** passes its health
+checks, has the exact reviewed managed-nginx file digest and enabled-link target,
+has every configured upstream listener reachable, and serves the exact expected
+build. It requires `healthChecks`, `nginx.config` and `verify` configuration; an
+approved predecessor digest does not qualify. Failed hosts do not skip checks on
+other hosts. It reads config aliases without resolving deployment secrets, and
+never transfers files, installs dependencies, reloads services, syncs help or
+purges CDN state. A sufficiently valid local signed SSH certificate is reused;
+otherwise the CLI's supported SSH signing API obtains one. Authentication can
+therefore require an available Vault; the command never unseals it.
+
+Read-only PM2 checks connect to the existing PM2 RPC socket rather than running
+`pm2 jlist`, which could launch a missing daemon. Unsupported PM2 installation
+layouts or unavailable RPC fail closed. Read-only nginx verification checks disk
+identity/digest and live health/listeners/version without `nginx -t/-T`, because
+those commands can create log files. Normal deployments retain syntax, loaded
+include, drift and rollback gates.
+
+Static deployment opens permissions recursively on the selected build and each
+explicitly enumerated shared entry. All other top-level numeric build directories
+are excluded, including short historic names. Shared nested directories retain
+ownership needed for rsync mtimes. Permission restoration runs after transfer or
+opening failures. Local source symlinks/special files and unsafe remote paths or
+symlink trees are rejected. Shared rsync filters protect retained numeric builds.
+Cleanup still follows all rollout, health, purge and version gates.
+
+Each invocation owns a mode-0700 temporary SSH socket directory, shares its
+connections with rsync, and closes only its own masters on return, failure or
+handled termination signals. User-configured or another invocation's masters are
+never reused. Sessions expire at the certificate expiry or one hour, whichever
+comes first; idle masters also expire after 60 seconds. Like other process
+cleanup, immediate removal cannot be guaranteed after SIGKILL or power loss.
+
+Dependency hash, success stamp and `node_modules` presence are probed in one SSH
+round trip. Missing or unreadable manifests cannot authorize an install skip.
+Help synchronization hashes sorted filenames and Markdown bytes, skipping only
+content previously accepted by the same endpoint from the same local directory.
+Its private local stamp contains only a content digest, never a key or credential
+hash. HTTP/transport failures never update the stamp and remain non-blocking;
+key-only rotation does not require uploading already accepted unchanged content.
+
+`run --json` and `verify --json` retain the summary fields and add `timings`:
+`{phase, host?, durationMs, success, transferredBytes?}[]`. Host deployment records
+also include `durationMs` and, when available, `transferredBytes`. Byte counts are
+rsync's **total transferred file size**, not compressed wire bytes. Nested timing
+entries overlap; do not sum them as total elapsed time. Thrown preflight failures
+produce `{config, success:false, timings, error}` with nonzero exit status. No
+speed-up claim is made until a separately authorized rolling release is measured.
 
 ## Security model
 

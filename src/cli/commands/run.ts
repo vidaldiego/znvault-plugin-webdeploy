@@ -2,14 +2,15 @@
 import { readFileSync } from 'node:fs';
 import type { Command } from 'commander';
 import type { CLIPluginContext } from '../plugin-types.js';
-import type { HostConnection, RunSummary, WebDeployConfig } from '../types.js';
+import type { HostConnection, RunSummary, WebDeployConfig, PhaseTiming } from '../types.js';
 import { getConfig } from '../config-store.js';
 import { validateDeployConfig } from '../config-validate.js';
 import { Redactor, resolveConfigSecrets } from '../secret-resolver.js';
 import { ensureCertificate } from '../ssh-cert.js';
-import { sshExec, sshPipe, runRsync, validateRsyncVersion } from '../ssh-exec.js';
+import { sshExec, sshPipe, runRsync, validateRsyncVersion, withSshSession } from '../ssh-exec.js';
 import { acquireLock, releaseLock, installLockHandlers } from '../lock.js';
 import { runDeploy, type RunDeps } from '../run.js';
+import { validateStaticSource } from '../transfer.js';
 import { DEFAULT_CERT_TTL_SECONDS, DEFAULT_SSH_PRINCIPAL } from '../constants.js';
 
 export function buildSummaryLines(summary: RunSummary): string[] {
@@ -62,15 +63,16 @@ export async function prepareResolvedRun(
   const errors = validateDeployConfig(stored);
   if (errors.length > 0) throw new Error(`Invalid config '${name}': ${errors.join('; ')}`);
 
+  if (stored.static) validateStaticSource(stored.static.localPath, readFileSync(stored.versionFile, 'utf8').trim());
   const cfg = await resolveConfigSecrets(ctx.client, stored, redactor);
 
-  const { keyPath, certPath } = await ensureCertificate(ctx.client, {
+  const { keyPath, certPath, certificateExpiresAt } = await ensureCertificate(ctx.client, {
     principal: stored.ssh.principal ?? DEFAULT_SSH_PRINCIPAL,
     ttlSeconds: stored.ssh.ttlSeconds ?? DEFAULT_CERT_TTL_SECONDS,
   });
   assertTransportSafePaths(keyPath, certPath);
   const conns: HostConnection[] = cfg.hosts.map(host => ({
-    host, port: cfg.ssh.port ?? 22, user: cfg.ssh.user, keyPath, certPath,
+    host, port: cfg.ssh.port ?? 22, user: cfg.ssh.user, keyPath, certPath, certificateExpiresAt,
   }));
   return { cfg, conns, redactor };
 }
@@ -115,7 +117,7 @@ export function registerRunCommand(webdeploy: Command, ctx: CLIPluginContext): v
             sleep: ms => new Promise(r => setTimeout(r, ms)),
             redact: s => redactor.redact(s),
           };
-          const summary = await runDeploy(name, cfg, conns, deps);
+          const summary = await withSshSession(conns, connections => runDeploy(name, cfg, connections, deps));
 
           if (options.json) {
             console.log(redactor.redact(JSON.stringify(summary, null, 2)));
@@ -127,6 +129,7 @@ export function registerRunCommand(webdeploy: Command, ctx: CLIPluginContext): v
           releaseLock(name);
         }
       } catch (err) {
+        if (options.json) console.log(JSON.stringify({config:name,success:false,timings:(err as {timings?:PhaseTiming[]})?.timings ?? [],error:redactor.redact(err instanceof Error ? err.message : String(err))}));
         ctx.output.error(redactor.redact(err instanceof Error ? err.message : String(err)));
         process.exitCode = 1;
       }
