@@ -462,16 +462,25 @@ include, drift and rollback gates.
 Static deployment opens permissions recursively on the selected build and each
 explicitly enumerated shared entry. All other top-level numeric build directories
 are excluded, including short historic names. Shared nested directories retain
-ownership needed for rsync mtimes. Permission restoration runs after transfer or
-opening failures. Local source symlinks/special files and unsafe remote paths or
+ownership needed for rsync mtimes. An already-established remote shell owns an EXIT/HUP/INT/TERM trap before
+permissions open; restoration needs no new SSH authentication after a transfer,
+opening failure, disconnect or invocation expiry. It restores the root and all
+safe descendants without following links, reports unsafe paths after best-effort
+cleanup, and never lets one injected link suppress all restoration. Local source symlinks/special files and unsafe remote paths or
 symlink trees are rejected. Shared rsync filters protect retained numeric builds.
 Cleanup still follows all rollout, health, purge and version gates.
 
 Each invocation owns a mode-0700 temporary SSH socket directory, shares its
 connections with rsync, and closes only its own masters on return, failure or
 handled termination signals. User-configured or another invocation's masters are
-never reused. Sessions expire at the certificate expiry or one hour, whichever
-comes first; idle masters also expire after 60 seconds. Like other process
+never reused. Deploy invocations require at least 35 minutes of certificate validity before
+starting (renewing through the supported signing API if needed), run for at most
+30 minutes, and refuse a new host with less than five minutes remaining. Certificate
+reuse/signing happens before deployment starts; it is not repeated mid-rollout.
+This certificate validity budget is separate from the Vault unseal window: the
+plugin neither unseals Vault nor changes/extends its unseal TTL. Verify
+sessions expire at certificate expiry or one hour, whichever comes first. No
+master is extended for recovery; idle masters also expire after 60 seconds. Like other process
 cleanup, immediate removal cannot be guaranteed after SIGKILL or power loss.
 
 Dependency hash, success stamp and `node_modules` presence are probed in one SSH

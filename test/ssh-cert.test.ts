@@ -74,3 +74,10 @@ it('returns the existing certificate expiry without signing when validity is suf
   const result=await ensureCertificate({post:async()=>{throw new Error('must not sign');}} as never,{keyPath:'/k/key',principal:'deploy',ttlSeconds:3600,io:{exists:()=>true,read:()=>'',write:()=>{throw new Error('must not write');},sshKeygenL:()=>future}});
   expect(result.certificateExpiresAt).toBe(new Date('2099-07-04T18:00:00').getTime());
 });
+it('renews a valid certificate that cannot cover the required bounded deployment budget',async()=>{
+  const format=(ms:number)=>new Date(ms).toISOString().replace(/\.\d{3}Z$/,'Z');
+  let signed=false;const now=Date.now();
+  const output=()=>KEYGEN_OUTPUT.replace('2026-07-04T10:00:00',format(now-60000)).replace('2026-07-04T18:00:00',format(now+(signed?3600000:600000)));
+  await ensureCertificate({post:async()=>{signed=true;return {certificate:'public signed certificate'};}} as never,{principal:'deploy',ttlSeconds:3600,keyPath:'/k/key',minimumValidityMs:2100000,io:{exists:()=>true,read:()=> 'public key',write:()=>{},sshKeygenL:output}});
+  expect(signed).toBe(true);
+});

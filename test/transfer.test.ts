@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { syncAppDir, installAppDeps, deployStatic, cleanupOldBuilds, withRemotePermissions, shouldInstallRemote } from '../src/cli/transfer.js';
+import { syncAppDir, installAppDeps, deployStatic, cleanupOldBuilds, shouldInstallRemote } from '../src/cli/transfer.js';
 import type { HostConnection, ExecResult, WebDeployConfig } from '../src/cli/types.js';
 
 const conn: HostConnection = { host: '192.0.2.1', port: 22, user: 'ops', keyPath: '/k/id', certPath: '/k/cert' };
@@ -20,6 +20,7 @@ function harness() {
         return { code: 0, stdout: '', stderr: '' };
       },
       rsync: async (args: string[]) => { rsyncCalls.push(args); },
+      permissions: async (_c: HostConnection, open: string, restore: string, action: () => Promise<void>) => { execCalls.push(open); try { await action(); } finally { execCalls.push(restore); } },
       log: () => {},
     },
     execCalls, rsyncCalls,
@@ -224,53 +225,9 @@ describe('cleanupOldBuilds', () => {
   it('scopes the permission wrap to the webroot NON-recursively (QW3 — does not walk every build dir)', async () => {
     const h = harness();
     await cleanupOldBuilds(h.deps, conn, cfg);
-    expect(h.execCalls[0]).toBe('sudo chown ops:www-data /var/www/');
+    expect(h.execCalls[0]).toContain('sudo chown ops:www-data /var/www/');
     expect(h.execCalls[0]).not.toContain('-R');
     expect(h.execCalls.at(-1)).toContain('chmod g-w /var/www/');
     expect(h.execCalls.at(-1)).not.toContain('-R');
-  });
-});
-
-describe('withRemotePermissions', () => {
-  it('restores permissions even when fn throws (default recursive:true, backward-compatible)', async () => {
-    const h = harness();
-    await expect(withRemotePermissions(h.deps, conn, '/var/www/', async () => { throw new Error('boom'); }))
-      .rejects.toThrow('boom');
-    expect(h.execCalls[0]).toContain('chown -R ops:www-data /var/www/');
-    expect(h.execCalls.at(-1)).toContain('g-w');
-    expect(h.execCalls.at(-1)).toContain('-R');
-  });
-
-  it('surfaces the original error (not the restore failure) when both fn and restore throw, and logs a warning', async () => {
-    const h = harness();
-    const logs: string[] = [];
-    h.deps.log = (line: string) => { logs.push(line); };
-    h.deps.exec = async (_c: HostConnection, command: string): Promise<ExecResult> => {
-      h.execCalls.push(command);
-      if (command.includes('chown -R www-data:www-data') || command.includes('g-w')) {
-        return { code: 1, stdout: '', stderr: 'restore failed' };
-      }
-      return { code: 0, stdout: '', stderr: '' };
-    };
-    await expect(withRemotePermissions(h.deps, conn, '/var/www/', async () => { throw new Error('boom'); }))
-      .rejects.toThrow('boom');
-    expect(logs.some(l => l.includes('WARNING') && l.includes('restore'))).toBe(true);
-  });
-
-  it('emits chown/chmod WITHOUT -R when {recursive:false} is passed', async () => {
-    const h = harness();
-    await withRemotePermissions(h.deps, conn, '/var/www/', { recursive: false }, async () => {});
-    expect(h.execCalls[0]).toBe('sudo chown ops:www-data /var/www/');
-    expect(h.execCalls[1]).toBe('sudo chmod g+w /var/www/');
-    expect(h.execCalls[2]).toBe('sudo chown www-data:www-data /var/www/');
-    expect(h.execCalls[3]).toBe('sudo chmod g-w /var/www/');
-    expect(h.execCalls.every(c => !c.includes('-R'))).toBe(true);
-  });
-
-  it('still restores perms and preserves the original error when {recursive:false} and fn throws', async () => {
-    const h = harness();
-    await expect(withRemotePermissions(h.deps, conn, '/var/www/', { recursive: false }, async () => { throw new Error('boom'); }))
-      .rejects.toThrow('boom');
-    expect(h.execCalls.at(-1)).toBe('sudo chmod g-w /var/www/');
   });
 });

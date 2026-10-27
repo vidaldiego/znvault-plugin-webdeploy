@@ -11,7 +11,7 @@ import { sshExec, sshPipe, runRsync, validateRsyncVersion, withSshSession } from
 import { acquireLock, releaseLock, installLockHandlers } from '../lock.js';
 import { runDeploy, type RunDeps } from '../run.js';
 import { validateStaticSource } from '../transfer.js';
-import { DEFAULT_CERT_TTL_SECONDS, DEFAULT_SSH_PRINCIPAL } from '../constants.js';
+import { DEFAULT_CERT_TTL_SECONDS, DEFAULT_SSH_PRINCIPAL, DEPLOY_SESSION_BUDGET_MS, HOST_AUTHORIZATION_MARGIN_MS } from '../constants.js';
 
 export function buildSummaryLines(summary: RunSummary): string[] {
   const lines: string[] = [];
@@ -67,6 +67,7 @@ export async function prepareResolvedRun(
   const cfg = await resolveConfigSecrets(ctx.client, stored, redactor);
 
   const { keyPath, certPath, certificateExpiresAt } = await ensureCertificate(ctx.client, {
+    minimumValidityMs: DEPLOY_SESSION_BUDGET_MS + HOST_AUTHORIZATION_MARGIN_MS,
     principal: stored.ssh.principal ?? DEFAULT_SSH_PRINCIPAL,
     ttlSeconds: stored.ssh.ttlSeconds ?? DEFAULT_CERT_TTL_SECONDS,
   });
@@ -117,7 +118,7 @@ export function registerRunCommand(webdeploy: Command, ctx: CLIPluginContext): v
             sleep: ms => new Promise(r => setTimeout(r, ms)),
             redact: s => redactor.redact(s),
           };
-          const summary = await withSshSession(conns, connections => runDeploy(name, cfg, connections, deps));
+          const summary = await withSshSession(conns, connections => runDeploy(name, cfg, connections, deps), { maxDurationMs: DEPLOY_SESSION_BUDGET_MS });
 
           if (options.json) {
             console.log(redactor.redact(JSON.stringify(summary, null, 2)));

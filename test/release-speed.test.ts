@@ -2,8 +2,9 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { deployStatic, installAppDeps, cleanupOldBuilds } from '../src/cli/transfer.js';
+import { permissionSessionScript, runPermissionProcess } from '../src/cli/ssh-exec.js';
 import { syncHelp } from '../src/cli/notify.js';
 import type { HostConnection, WebDeployConfig } from '../src/cli/types.js';
 const dirs: string[] = [];
@@ -18,37 +19,40 @@ describe('scoped static permissions', () => {
     mkdirSync(bin); mkdirSync(web);
     for (const d of ['42/old', '30541/old', 'tinymce/plugins/nested']) mkdirSync(join(web, d), { recursive: true });
     writeFileSync(join(web, 'tinymce/plugins/nested/file.js'), 'old');
+    writeFileSync(join(bin, 'chown'), '#!/bin/bash\nprintf "%s\\n" "chown $*" >> "$CALLS"\n', {mode:0o755});
+    writeFileSync(join(bin, 'chmod'), '#!/bin/bash\nprintf "%s\\n" "chmod $*" >> "$CALLS"\n', {mode:0o755});
     writeFileSync(join(bin, 'sudo'), '#!/bin/bash\nif [[ "$1" == chown || "$1" == chmod ]]; then printf "%s\\n" "$*" >> "$CALLS"; else exec "$@"; fi\n', { mode: 0o755 });
     const exec = async (_c: HostConnection, command: string) => {
       try { return { code: 0, stdout: execFileSync('bash', ['-c', command], { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, CALLS: log } }), stderr: '' }; }
       catch { return { code: 1, stdout: '', stderr: 'fixture rejected' }; }
     };
     const cfg: WebDeployConfig = { hosts: ['h'], ssh: { user: 'ops' }, versionFile: 'v', static: { localPath: 'public/', remotePath: `${web}/` } };
-    return { web, log, exec, cfg, bin };
+    const permissions = async (_c: HostConnection, open: string, restore: string, action: () => Promise<void>) => runPermissionProcess(spawn('bash', ['-c', permissionSessionScript(open,restore)], {env:{...process.env,PATH:`${bin}:${process.env.PATH}`,CALLS:log}}),'fixture',action);
+    return { web, log, exec, cfg, bin, permissions };
   }
   it('opens and restores shared nested trees without recursively touching any retained numeric directory', async () => {
     const f = fixture();
-    await expect(deployStatic({ exec: f.exec, rsync: async args => { if (args.includes('--delay-updates')) throw new Error('transfer failed'); }, log: () => {} }, conn, f.cfg, '30542')).rejects.toThrow('transfer failed');
+    await expect(deployStatic({ permissions: f.permissions, exec: f.exec, rsync: async args => { if (args.includes('--delay-updates')) throw new Error('transfer failed'); }, log: () => {} }, conn, f.cfg, '30542')).rejects.toThrow('transfer failed');
     const calls = readFileSync(f.log, 'utf8').trim().split('\n');
     expect(calls.some(c => c.includes(`-R ops:www-data ${f.web}/tinymce`))).toBe(true);
-    expect(calls.some(c => c.includes(`-R www-data:www-data ${f.web}/tinymce`))).toBe(true);
+    expect(calls.some(c => c.includes(`www-data:www-data ${f.web}/tinymce`))).toBe(true);
     expect(calls.some(c => /-R .*\/(42|30541)(\/|$)/.test(c))).toBe(false);
     expect(calls.some(c => c.endsWith(`-R ops:www-data ${f.web}/`))).toBe(false);
   });
   it('rejects shared symlinks before changing permissions on their target', async () => {
     const f = fixture(); const outside = temp();
     symlinkSync(outside, join(f.web, 'tinymce/plugins/link'));
-    await expect(deployStatic({ exec: f.exec, rsync: async () => {}, log: () => {} }, conn, f.cfg, '30542')).rejects.toThrow();
+    await expect(deployStatic({ permissions: f.permissions, exec: f.exec, rsync: async () => {}, log: () => {} }, conn, f.cfg, '30542')).rejects.toThrow();
   });
   it('fails closed before transfer when symlink enumeration cannot be read', async () => {
     const f = fixture(); let transfers = 0;
     writeFileSync(join(f.bin, 'find'), '#!/bin/bash\nexit 1\n', {mode:0o755});
-    await expect(deployStatic({exec:f.exec,rsync:async()=>{transfers++;},log:()=>{}},conn,f.cfg,'30542')).rejects.toThrow();
+    await expect(deployStatic({permissions:f.permissions,exec:f.exec,rsync:async()=>{transfers++;},log:()=>{}},conn,f.cfg,'30542')).rejects.toThrow();
     expect(transfers).toBe(0);
   });
   it('retention removes only exact numeric directories and preserves digit-prefixed shared content', async () => {
     const f = fixture(); mkdirSync(join(f.web, '30542')); mkdirSync(join(f.web, '12345-shared'));
-    await cleanupOldBuilds({exec:f.exec,rsync:async()=>{},log:()=>{}},conn,{...f.cfg,static:{...f.cfg.static!,retentionCount:1}});
+    await cleanupOldBuilds({permissions:f.permissions,exec:f.exec,rsync:async()=>{},log:()=>{}},conn,{...f.cfg,static:{...f.cfg.static!,retentionCount:1}});
     const {existsSync}=await import('node:fs');
     expect(existsSync(join(f.web,'12345-shared'))).toBe(true);
     expect(existsSync(join(f.web,'30542'))).toBe(true);
@@ -89,12 +93,6 @@ describe('help success digest', () => {
   });
 });
 
-it('restores ownership after a permission-open failure before transfer',async()=>{
-  const {withRemotePermissions}=await import('../src/cli/transfer.js');
-  const calls:string[]=[];
-  await expect(withRemotePermissions({exec:async(_c,cmd)=>{calls.push(cmd); return {code:cmd.includes('g+w')?1:0,stdout:'',stderr:'chmod failed'};},rsync:async()=>{},log:()=>{}},conn,'/var/www/30542/',async()=>{throw new Error('must not transfer');})).rejects.toThrow('chmod');
-  expect(calls.some(c=>c.includes('chown -R www-data:www-data'))).toBe(true);
-});
 it('rejects a local static source symlink before it can be transferred',async()=>{
   const {validateStaticSource}=await import('../src/cli/transfer.js');
   const source=temp();const target=temp();mkdirSync(join(source,'30542'));mkdirSync(join(source,'nested'));symlinkSync(target,join(source,'nested','link'));

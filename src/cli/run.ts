@@ -6,13 +6,15 @@ import { reloadOrStartPm2, reloadNginx } from './pm2.js';
 import { runHealthChecks } from './health.js';
 import { purgeCloudflare, verifyVersions } from './cdn-cloudflare.js';
 import { sendWebhook, syncHelp } from './notify.js';
-import { VERSION_VERIFY_CEILING_MS } from './constants.js';
+import { VERSION_VERIFY_CEILING_MS, HOST_AUTHORIZATION_MARGIN_MS } from './constants.js';
 import { probeVersion } from './http-probe.js';
+import type { PermissionSession } from './ssh-exec.js';
 import { Timings } from './timing.js';
 import { readFileSync } from 'node:fs';
 import { applyNginx, assertNginxBaseline, checkNginxListeners, digest, readNginxHash, rollbackNginx, type NginxChange } from './nginx.js';
 
 export interface RunDeps {
+  permissions?: PermissionSession;
   exec: Exec;
   pipe: ExecPipe;
   rsync(args: string[]): Promise<void | TransferStats>;
@@ -46,7 +48,7 @@ export function renderEnvFile(env: Record<string, string>): string {
 
 async function deployHost(cfg: WebDeployConfig, conn: HostConnection, build: string, deps: RunDeps, timing: Timings, nginxContent?: string): Promise<NginxChange | undefined> {
   const measure = <T>(phase: string, fn: () => Promise<T>) => timing.measure(phase, conn.host, fn);
-  const tdeps: TransferDeps = { exec: deps.exec, rsync: args => measure('rsync', () => deps.rsync(args)), log: deps.log };
+  const tdeps: TransferDeps = { permissions: deps.permissions, exec: deps.exec, rsync: args => measure('rsync', () => deps.rsync(args)), log: deps.log };
 
   if (cfg.app) {
     await measure('app-sync', () => syncAppDir(tdeps, conn, cfg));
@@ -125,6 +127,7 @@ export async function runDeploy(
     let nginxChange: NginxChange | undefined;
     try {
       deps.log(`=== Deploying ${conn.host} (${i + 1}/${conns.length}) ===`);
+      if (conn.certificateExpiresAt !== undefined && conn.certificateExpiresAt - Date.now() < HOST_AUTHORIZATION_MARGIN_MS) throw new Error('Insufficient remaining SSH authorization to begin this host');
       mutationAttempted = true;
       nginxChange = await timing.measure('host-deploy', conn.host, () => deployHost(cfg, conn, build, deps, timing, nginxContent));
     } catch (err) {
@@ -196,7 +199,7 @@ export async function runDeploy(
   // Old assets are the recovery boundary for stale cached HTML and an
   // incomplete rollout. Retire them only after every blocking gate converges.
   if (anyDeployed && summary.success) {
-    const tdeps: TransferDeps = { exec: deps.exec, rsync: deps.rsync, log: deps.log };
+    const tdeps: TransferDeps = { permissions: deps.permissions, exec: deps.exec, rsync: deps.rsync, log: deps.log };
     for (const h of hosts) {
       const conn = conns.find(c => c.host === h.host)!;
       try {

@@ -1,5 +1,5 @@
 // Path: src/cli/ssh-exec.ts
-import { spawn, execSync, execFileSync } from 'node:child_process';
+import { spawn, execSync, execFileSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { mkdtempSync, chmodSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Exec, ExecPipe, ExecResult, HostConnection, TransferStats } from './types.js';
@@ -146,4 +146,74 @@ export function parseRsyncStats(output: string): TransferStats {
   const match = /^Total transferred file size:\s*([0-9,]+) bytes/m.exec(output);
   const transferredBytes = match ? Number(match[1]!.replace(/,/g, '')) : NaN;
   return Number.isSafeInteger(transferredBytes) && transferredBytes >= 0 ? { transferredBytes } : {};
+}
+
+export type PermissionSession = (
+  conn: HostConnection, open: string, restore: string, action: () => Promise<void>
+) => Promise<void>;
+
+/** The remote shell owns restoration before permissions open. EOF and handled
+ * signals run that same shell's trap, without a new certificate-authenticated
+ * connection. No master lifetime or certificate authorization is extended. */
+export function permissionSessionScript(open: string, restore: string): string {
+  return `set -euo pipefail
+restore_permissions() {
+  code=$?
+  trap - EXIT HUP INT TERM
+  if ( ${restore} ); then
+    printf '__WEBDEPLOY_RESTORED__\\n'
+  else
+    echo 'remote permission restoration failed' >&2
+    exit 1
+  fi
+  exit "$code"
+}
+trap restore_permissions EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+${open}
+printf '__WEBDEPLOY_READY__\\n'
+IFS= read -r outcome
+test "$outcome" = complete
+`;
+}
+
+export const sshPermissionSession: PermissionSession = async (conn, open, restore, action) => {
+  const script = permissionSessionScript(open, restore);
+  const quoted = `'${script.replace(/'/g, `'"'"'`)}'`;
+  const child = spawn('ssh', [...sshBaseArgs(conn), `${conn.user}@${conn.host}`, `bash -c ${quoted}`]);
+  return runPermissionProcess(child, conn.host, action);
+};
+
+export async function runPermissionProcess(child: ChildProcessWithoutNullStreams, host: string, action: () => Promise<void>): Promise<void> {
+  child.stdin.on('error', () => {});
+  let output = '';
+  let ready = false;
+  let restored = false;
+  let start!: () => void;
+  let failStart!: (error: Error) => void;
+  const started = new Promise<void>((resolve, reject) => { start = resolve; failStart = reject; });
+  const closed = new Promise<number>(resolve => {
+    child.on('error', error => { failStart(error); resolve(1); });
+    child.on('close', code => {
+      if (!ready) failStart(new Error(`[${host}] permission opening failed`));
+      resolve(code ?? 1);
+    });
+  });
+  child.stdout.on('data', chunk => {
+    output = (output + String(chunk)).slice(-65536);
+    if (/(^|\n)__WEBDEPLOY_READY__\n/.test(output)) { ready = true; start(); }
+    if (/(^|\n)__WEBDEPLOY_RESTORED__\n/.test(output)) restored = true;
+  });
+  // Drain stderr, but don't retain arbitrary remote output in failure receipts.
+  child.stderr.resume();
+  let failure: unknown;
+  try { await started; await action(); }
+  catch (error) { failure = error; }
+  finally { child.stdin.end(failure === undefined ? 'complete\n' : 'abort\n'); }
+  const code = await closed;
+  if (!restored) throw new Error(`${failure instanceof Error ? failure.message : 'Transfer failed'}; remote permission restoration failed`);
+  if (failure !== undefined) throw failure;
+  if (code !== 0) throw new Error(`[${host}] permission transaction interrupted`);
 }

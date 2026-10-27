@@ -25,6 +25,7 @@ const PM2_OK = JSON.stringify([{ name: 'www', pm2_env: { status: 'online' } }]);
 function makeDeps(opts: { failHost?: string; nginxDownOn?: string; redact?: (s: string) => string } = {}) {
   const events: string[] = [];
   const deps: RunDeps = {
+    permissions: async (_c,_open,_restore,action) => action(),
     exec: async (conn, command): Promise<ExecResult> => {
       events.push(`exec:${conn.host}:${command}`);
       if (command.includes('pm2 jlist')) return { code: 0, stdout: PM2_OK, stderr: '' };
@@ -241,6 +242,7 @@ describe('nginx reload gating', () => {
   function makeSimpleDeps() {
     const execCommands: string[] = [];
     const deps: RunDeps = {
+      permissions: async (_c,_open,_restore,action) => action(),
       exec: async (_conn, command): Promise<ExecResult> => {
         execCommands.push(command);
         if (command.includes('pm2 jlist')) return { code: 0, stdout: PM2_OK, stderr: '' };
@@ -329,4 +331,10 @@ it('retains failure timing evidence when a pre-mutation nginx baseline check thr
   const managedCfg={...cfg,nginx:{config:{localPath:'unused',remotePath:'/etc/nginx/sites-available/default',enabledPath:'/etc/nginx/sites-enabled/default',upstream:'myzn'}}};
   try {await runDeploy('prod',managedCfg,conns,deps);throw new Error('must reject');}
   catch(error){expect((error as {timings?:unknown[]}).timings).toEqual([expect.objectContaining({phase:'nginx-baseline',host:'192.0.2.1',success:false})]);}
+});
+it('does not begin a host mutation with less than the minimum remaining authorization budget',async()=>{
+  const {deps,events}=makeDeps();
+  const result=await runDeploy('prod',cfg,conns.map(c=>({...c,certificateExpiresAt:Date.now()+1000})),deps);
+  expect(result.success).toBe(false);expect(result.recoveryRequired).toBe(false);
+  expect(events.some(e=>e.startsWith('rsync:')||e.startsWith('pipe:')||e.includes('mkdir'))).toBe(false);
 });

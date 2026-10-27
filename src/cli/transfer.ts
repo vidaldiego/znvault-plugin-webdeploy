@@ -2,13 +2,14 @@ import { lstatSync, readdirSync, realpathSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 // Path: src/cli/transfer.ts
 import type { Exec, HostConnection, WebDeployConfig, TransferStats } from './types.js';
-import { buildRsyncArgs, execOrThrow, sshTransportString } from './ssh-exec.js';
+import { buildRsyncArgs, execOrThrow, sshTransportString, sshPermissionSession, type PermissionSession } from './ssh-exec.js';
 import { DEFAULT_RETENTION_COUNT } from './constants.js';
 
 export interface TransferDeps {
   exec: Exec;
   rsync(args: string[]): Promise<void | TransferStats>;
   log(line: string): void;
+  permissions?: PermissionSession;
 }
 
 
@@ -39,28 +40,14 @@ export async function withRemotePermissions(
   const recursive = opts.recursive ?? true;
   const flag = recursive ? '-R ' : '';
 
-  deps.log(`[${conn.host}] Opening group-write on ${dir}...`);
-  let fnError: unknown;
-  try {
-    await execOrThrow(deps.exec, conn, `sudo chown ${flag}${conn.user}:www-data ${dir}`, 'chown (open)');
-    await execOrThrow(deps.exec, conn, `sudo chmod ${flag}g+w ${dir}`, 'chmod (open)');
-    await fn();
-  } catch (err) {
-    fnError = err;
-  }
-  try {
-    deps.log(`[${conn.host}] Restoring permissions on ${dir}...`);
-    await execOrThrow(deps.exec, conn, `sudo chown ${flag}www-data:www-data ${dir}`, 'chown (restore)');
-    await execOrThrow(deps.exec, conn, `sudo chmod ${flag}g-w ${dir}`, 'chmod (restore)');
-  } catch (restoreErr) {
-    if (fnError !== undefined) {
-      // Original failure wins; the restore failure must not shadow it.
-      deps.log(`[${conn.host}] WARNING: permission restore also failed: ${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}`);
-    } else {
-      throw restoreErr;
-    }
-  }
-  if (fnError !== undefined) throw fnError;
+  const open = `sudo chown ${flag}${conn.user}:www-data ${dir}\nsudo chmod ${flag}g+w ${dir}`;
+  // Attempt both restorations even if the first fails. No recursive symlink
+  // traversal: restore only real files/directories under this accepted root.
+  const restore = recursive
+    ? safeRestoreScript(dir, false)
+    : `status=0; sudo chown www-data:www-data ${dir} || status=1; sudo chmod g-w ${dir} || status=1; exit "$status"`;
+  await (deps.permissions ?? sshPermissionSession)(conn, open, restore, fn);
+
 }
 
 const INSTALL_STAMP_FILE = '.deploy-install-stamp';
@@ -160,12 +147,39 @@ test ! -d ${app.remotePath}/node_modules || printf 'present\\n'`)} `);
 
 const shellQuote = (value: string): string => `'${value.replace(/'/g, `'"'"'`)}'`;
 
+/** Recovery is best-effort across every safe entry, never fail-fast on one
+ * injected symlink. Root and safe descendants are restored without following
+ * links. A skipped unsafe path still makes the transaction fail visibly. */
+function safeRestoreScript(dir: string, shared: boolean): string {
+  return `set -u
+root=${shellQuote(dir.replace(/\/$/, ''))}
+test -d "$root" && test ! -L "$root" && test "$(realpath "$root")" = "$root" || exit 1
+status=0
+sudo chown www-data:www-data "$root" || status=1
+sudo chmod g-w "$root" || status=1
+restore_entry() {
+  entry=$1
+  if [ -L "$entry" ]; then status=1; return; fi
+  links=$(sudo find -P "$entry" -type l -print -quit) || status=1
+  if [ -n "$links" ]; then status=1; fi
+  sudo find -P "$entry" -type l -prune -o -exec chown -h www-data:www-data {} + -exec chmod g-w {} + || status=1
+}
+${shared ? `shopt -s nullglob dotglob
+for entry in "$root"/*; do
+  name=\${entry##*/}
+  if [[ "$name" =~ ^[0-9]+$ ]] && [ -d "$entry" ] && [ ! -L "$entry" ]; then continue; fi
+  restore_entry "$entry"
+done` : `restore_entry "$root"`}
+exit "$status"`;
+}
+
 /** Enumerate only top-level shared entries. Numeric build directories are never
  * descended into, including short historical build numbers. Reject links before
  * any recursive ownership operation; rsync needs ownership for nested mtimes. */
 export function sharedPermissionsScript(dir: string, user: string, restore: boolean): string {
-  const owner = restore ? 'www-data:www-data' : `${user}:www-data`;
-  const mode = restore ? 'g-w' : 'g+w';
+  if (restore) return safeRestoreScript(dir, true);
+  const owner = `${user}:www-data`;
+  const mode = 'g+w';
   return `set -euo pipefail
 root=${shellQuote(dir.replace(/\/$/, ''))}
 test -d "$root" && test ! -L "$root"
@@ -189,18 +203,10 @@ done`;
 }
 
 async function withSharedPermissions(deps: TransferDeps, conn: HostConnection, dir: string, fn: () => Promise<void>): Promise<void> {
-  let failure: unknown;
-  try {
-    await execOrThrow(deps.exec, conn, `bash -c ${shellQuote(sharedPermissionsScript(dir, conn.user, false))}`, 'shared permissions (open)');
-    await fn();
-  } catch (error) { failure = error; }
-  try {
-    await execOrThrow(deps.exec, conn, `bash -c ${shellQuote(sharedPermissionsScript(dir, conn.user, true))}`, 'shared permissions (restore)');
-  } catch (error) {
-    if (failure === undefined) throw error;
-    deps.log(`[${conn.host}] WARNING: shared permission restore also failed`);
-  }
-  if (failure !== undefined) throw failure;
+  await (deps.permissions ?? sshPermissionSession)(conn,
+    `bash -c ${shellQuote(sharedPermissionsScript(dir, conn.user, false))}`,
+    `bash -c ${shellQuote(sharedPermissionsScript(dir, conn.user, true))}`,
+    fn);
 }
 
 export async function deployStatic(

@@ -44,10 +44,10 @@ export function parseCertInfo(output: string): CertInfo {
   return { principals, validBefore, validAfter };
 }
 
-export function certIsUsable(info: CertInfo, principal: string, now: Date): { ok: boolean; reason?: string } {
+export function certIsUsable(info: CertInfo, principal: string, now: Date, minimumValidityMs = EXPIRY_BUFFER_MS): { ok: boolean; reason?: string } {
   if (!info.validBefore || !Number.isFinite(info.validBefore.getTime())) return { ok: false, reason: 'could not parse validity' };
   if (info.validAfter && (!Number.isFinite(info.validAfter.getTime()) || info.validAfter.getTime() > now.getTime())) return {ok:false, reason:'not yet valid'};
-  if (info.validBefore.getTime() - now.getTime() < EXPIRY_BUFFER_MS) return { ok: false, reason: 'expired or expiring soon' };
+  if (info.validBefore.getTime() - now.getTime() < Math.max(EXPIRY_BUFFER_MS, minimumValidityMs)) return { ok: false, reason: 'expired or expiring soon' };
   if (!info.principals.includes(principal)) return { ok: false, reason: `missing principal '${principal}' (has: ${info.principals.join(', ') || 'none'})` };
   return { ok: true };
 }
@@ -62,7 +62,7 @@ function findDefaultKey(io: CertIO): string {
 
 export async function ensureCertificate(
   client: VaultClient,
-  opts: { principal: string; ttlSeconds: number; keyPath?: string; io?: CertIO }
+  opts: { principal: string; ttlSeconds: number; minimumValidityMs?: number; keyPath?: string; io?: CertIO }
 ): Promise<{ keyPath: string; certPath: string; certificateExpiresAt: number }> {
   const io = opts.io ?? realIO;
   const keyPath = opts.keyPath ?? findDefaultKey(io);
@@ -71,7 +71,7 @@ export async function ensureCertificate(
   if (io.exists(certPath)) {
     try {
       const info = parseCertInfo(io.sshKeygenL(certPath));
-      if (certIsUsable(info, opts.principal, new Date()).ok) return { keyPath, certPath, certificateExpiresAt: info.validBefore!.getTime() };
+      if (certIsUsable(info, opts.principal, new Date(), opts.minimumValidityMs).ok) return { keyPath, certPath, certificateExpiresAt: info.validBefore!.getTime() };
     } catch {
       // fall through to re-sign
     }
@@ -85,7 +85,7 @@ export async function ensureCertificate(
   });
   io.write(certPath, result.certificate.trim() + '\n');
   const info = parseCertInfo(io.sshKeygenL(certPath));
-  const validity = certIsUsable(info, opts.principal, new Date());
+  const validity = certIsUsable(info, opts.principal, new Date(), opts.minimumValidityMs);
   if (!validity.ok) throw new Error(`Signed SSH certificate is unusable: ${validity.reason}`);
   return { keyPath, certPath, certificateExpiresAt: info.validBefore!.getTime() };
 }
